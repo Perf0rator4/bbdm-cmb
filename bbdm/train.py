@@ -4,7 +4,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from copy import deepcopy
 from tqdm.notebook import tqdm
-from bbdm.config import CHECKPOINT_DIR, EMA_START
+from bbdm.config import CHECKPOINT_DIR, EMA_DECAY, GRAD_CLIP, SCHEDULER_FACTOR, SCHEDULER_PATIENCE
 
 
 class EMA:
@@ -53,9 +53,9 @@ def train(
     bbdm = bbdm.to(device)
     optimizer = torch.optim.Adam(bbdm.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, factor=0.5, patience=3000
+        optimizer, factor=SCHEDULER_FACTOR, patience=SCHEDULER_PATIENCE
     )
-    ema = EMA(bbdm.model, decay=0.995)
+    ema = EMA(bbdm.model, decay=EMA_DECAY)
 
     global_step = 0
     best_val_loss = float("inf")
@@ -71,7 +71,7 @@ def train(
             optimizer.zero_grad()
             loss = bbdm.loss(x0, y)
             loss.backward()
-            nn.utils.clip_grad_norm_(bbdm.parameters(), 1.0)
+            nn.utils.clip_grad_norm_(bbdm.parameters(), GRAD_CLIP)
             optimizer.step()
 
             if global_step >= ema_start:

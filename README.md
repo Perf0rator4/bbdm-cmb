@@ -69,7 +69,7 @@ CHECKPOINT_DIR = "/path/to/checkpoints"
 Open `bbdm_cmb_2.ipynb` in Google Colab. The notebook covers:
 - Data loading and sanity checks
 - Model initialisation
-- Training (100 epochs, ~[N] hours on A100)
+- Training (100 epochs, 32 hours on A40)
 - Inference with 3 stochastic samples
 - RAPSD and Transfer Function evaluation
 
@@ -116,8 +116,6 @@ Current results (pre-bugfix checkpoint):
 
 Low scores are caused by two implementation bugs (now fixed) rather than fundamental model failure. Visual inspection shows the model correctly reproduces large-scale CMB structure.
 
-![Inference samples](20260525_16_14_36.jpg)
-![RAPSD and Transfer Function](20260525_16_14_31.jpg)
 
 ---
 

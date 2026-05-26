@@ -40,19 +40,27 @@ Download the data and set the paths in `config.py` before running.
 ## Project Structure
 
 ```
-├── config.py          # All hyperparameters and paths
-├── dataset.py         # CMBPatchDataset, tiling, normalisation
-├── splits.py          # Train/val/test tile splits
-├── unet.py            # U-Net backbone (33M parameters)
-├── bbdm.py            # Brownian Bridge Diffusion Model
-├── train.py           # Training loop with EMA
-├── sample.py          # Inference and visualisation
-├── power_spectrum.py  # RAPSD and Transfer Function metrics
-└── bbdm_cmb_2.ipynb   # End-to-end Colab notebook
+bbdm-cmb/
+├── README.md
+├── requirements.txt
+├── .gitignore
+│
+├── bbdm/                          # Core model and training code
+│   ├── __init__.py
+│   ├── config.py                  # All hyperparameters and paths
+│   ├── bbdm.py                    # Brownian Bridge Diffusion Model
+│   ├── unet.py                    # U-Net backbone (33M parameters)
+│   ├── dataset.py                 # CMBPatchDataset, tiling, normalisation
+│   ├── splits.py                  # Train/val/test tile splits
+│   ├── train.py                   # Training loop with EMA
+│   ├── sample.py                  # Inference and visualisation
+│   └── power_spectrum.py          # RAPSD and Transfer Function metrics
+│
+└── notebooks/                     # Jupyter notebooks for workflows
+    ├── batching_planck.ipynb 
+    ├── matching_planck_and_act.ipynb 
+    └── training+inference.ipynb 
 ```
-
----
-
 ## Quickstart
 
 **1. Set paths in `config.py`:**

@@ -72,7 +72,7 @@ CHECKPOINT_DIR = "/path/to/checkpoints"
 
 **2. Run the Colab notebook end-to-end:**
 
-Open `bbdm_cmb_2.ipynb` in Google Colab. The notebook covers:
+Open `training+inference.ipynb` in Google Colab. The notebook covers:
 - Data loading and sanity checks
 - Model initialisation
 - Training (100 epochs, 32 hours on A40)

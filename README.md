@@ -18,7 +18,7 @@ The model learns a stochastic mapping from low-resolution **Planck** patches (10
 pip install torch numpy astropy pixell scikit-image tqdm matplotlib
 ```
 
-Trained on Google Colab Pro+ with an NVIDIA A100 (80 GB VRAM). Batch size 32 requires ~18 GB VRAM — reduce `BATCH_SIZE` in `config.py` if needed.
+Trained on Google Colab Pro+ with an NVIDIA A40 (40 GB VRAM). Batch size 32 requires ~18 GB VRAM — reduce `BATCH_SIZE` in `config.py` if needed.
 
 ---
 

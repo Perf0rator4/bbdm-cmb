@@ -10,8 +10,6 @@ Brownian Bridge Diffusion Model (BBDM) for enhancing Planck microwave sky maps u
 
 The model learns a stochastic mapping from low-resolution **Planck** patches (100 GHz) to high-resolution **ACT+Planck** patches (90 GHz) using a Brownian Bridge diffusion process. Unlike standard conditional DDPMs, BBDM pins the forward process at both endpoints — the source image at `t=0` and the target image at `t=T` — which is a more natural formulation for paired image translation.
 
-**Reference:** Li et al., [BBDM: Image-to-image Translation with Brownian Bridge Diffusion Models](https://arxiv.org/abs/2205.07680), 2023.
-
 ---
 
 ## Requirements
@@ -127,13 +125,3 @@ Low scores are caused by two implementation bugs (now fixed) rather than fundame
 
 ---
 
-## Citation
-
-```bibtex
-@article{li2023bbdm,
-  title   = {BBDM: Image-to-image Translation with Brownian Bridge Diffusion Models},
-  author  = {Li, Bo and Xue, Kaitao and Liu, Bin and Lai, Yu-Kun},
-  journal = {arXiv preprint arXiv:2205.07680},
-  year    = {2023}
-}
-```

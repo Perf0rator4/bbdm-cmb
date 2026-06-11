@@ -4,7 +4,14 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from copy import deepcopy
 from tqdm.notebook import tqdm
-from bbdm.config import CHECKPOINT_DIR, EMA_DECAY, GRAD_CLIP, SCHEDULER_FACTOR, SCHEDULER_PATIENCE
+from config import (
+    CHECKPOINT_DIR,
+    EMA_START,
+    EMA_DECAY,
+    GRAD_CLIP,
+    SCHEDULER_FACTOR,
+    SCHEDULER_PATIENCE,
+)
 
 
 class EMA:
@@ -17,6 +24,12 @@ class EMA:
         for s_param, param in zip(self.shadow.parameters(), model.parameters()):
             s_param.data = self.decay * s_param.data + (1 - self.decay) * param.data
 
+    @torch.no_grad()
+    def copy_from(self, model):
+
+        for s_param, param in zip(self.shadow.parameters(), model.parameters()):
+            s_param.data.copy_(param.data)
+
     def apply_shadow(self, model):
         model.load_state_dict(self.shadow.state_dict())
 
@@ -28,7 +41,7 @@ def train(
     n_epochs=100,
     batch_size=32,
     lr=1e-4,
-    ema_start=10000,
+    ema_start=EMA_START,
     device="cuda",
     checkpoint_dir=CHECKPOINT_DIR,
 ):
@@ -52,6 +65,7 @@ def train(
 
     bbdm = bbdm.to(device)
     optimizer = torch.optim.Adam(bbdm.parameters(), lr=lr)
+
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, factor=SCHEDULER_FACTOR, patience=SCHEDULER_PATIENCE
     )
@@ -74,7 +88,10 @@ def train(
             nn.utils.clip_grad_norm_(bbdm.parameters(), GRAD_CLIP)
             optimizer.step()
 
-            if global_step >= ema_start:
+            if global_step == ema_start:
+
+                ema.copy_from(bbdm.model)
+            elif global_step > ema_start:
                 ema.update(bbdm.model)
 
             train_loss += loss.item()
@@ -106,6 +123,9 @@ def train(
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+
+            if global_step < ema_start:
+                ema.copy_from(bbdm.model)
             torch.save(
                 {
                     "epoch": epoch,

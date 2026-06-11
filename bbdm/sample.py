@@ -8,18 +8,22 @@ def denormalize(patch_norm, mu, sigma):
 
 
 @torch.no_grad()
-def run_inference(bbdm, x0_norm, y_norm, mu, sigma, S=200, device="cuda", n_samples=1):
+def run_inference(bbdm, x0_norm, mu, sigma, S=200, device="cuda", n_samples=1):
+
     bbdm = bbdm.to(device).eval()
 
-    if y_norm.ndim == 2:
-        y_norm = y_norm[None, None]
-    elif y_norm.ndim == 3:
-        y_norm = y_norm[None]
+    if isinstance(x0_norm, torch.Tensor):
+        x0_norm = x0_norm.cpu().numpy()
 
-    y = torch.tensor(y_norm, dtype=torch.float32).to(device)
-    y = y.expand(n_samples, -1, -1, -1)
+    if x0_norm.ndim == 2:
+        x0_norm = x0_norm[None, None]
+    elif x0_norm.ndim == 3:
+        x0_norm = x0_norm[None]
 
-    pred_norm = bbdm.sample(y, S=S)  # <- теперь передаём y
+    planck = torch.tensor(x0_norm, dtype=torch.float32).to(device)
+    planck = planck.expand(n_samples, -1, -1, -1)
+
+    pred_norm = bbdm.sample(planck, S=S)
 
     samples = []
     for i in range(n_samples):
@@ -41,7 +45,7 @@ def visualize_inference(x0_patch, y_patch, pred_patches):
         ax.axis("off")
 
     show(axes[0], x0_patch, "Planck (input)")
-    show(axes[1], y_patch,  "ACT+Planck (target)")
+    show(axes[1], y_patch, "ACT+Planck (target)")
     for i, pred in enumerate(pred_patches):
         show(axes[2 + i], pred, f"BBDM sample {i+1}")
 

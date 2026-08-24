@@ -68,9 +68,12 @@ Spectra are averaged over the batch before comparison: the goal is matching
 *ensemble* power, not the χ²-noisy spectrum of each individual realization.
 
 `ETA` (noise injected into the reverse process's start state) is **0**, matching
-the original paper's `x_T = y`. It is not a knob for fixing TF — see the note in
-[CLAUDE.md](CLAUDE.md) on why the earlier `ETA=0.01` merely cancelled two
-opposite defects.
+the original paper's `x_T = y`. It is deliberately not used as a knob for
+fixing TF: an earlier `ETA=0.01` produced a TF near 1 in a narrow band only
+because its white start-noise inflated high-ℓ power by roughly as much as the
+MSE objective suppressed it. Tuning ETA re-balances those two opposite defects
+instead of removing either, and shows up as a collapsing `r_ℓ` wherever the
+extra power is uncorrelated with the target.
 
 ---
 
@@ -113,7 +116,6 @@ sky between train and test.
 ```
 bbdm-cmb/
 ├── README.md
-├── CLAUDE.md                      # working context: history, diagnosis, next steps
 ├── requirements.txt
 │
 ├── bbdm/

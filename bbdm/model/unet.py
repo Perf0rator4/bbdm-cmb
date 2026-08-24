@@ -95,6 +95,7 @@ class UpBlock(nn.Module):
 class UNet(nn.Module):
     def __init__(self, in_ch=1, base_ch=64, time_dim=256, groups=8):
         super().__init__()
+        self.time_dim  = time_dim
         self.time_emb  = TimeEmbedding(time_dim, time_dim)
         self.init_conv = nn.Conv2d(in_ch, base_ch, 3, padding=1)
 
@@ -116,7 +117,9 @@ class UNet(nn.Module):
         self.out_conv = nn.Conv2d(base_ch//2, in_ch, 1)
 
     def forward(self, x, t):
-        t_emb = sinusoidal_embedding(t, dim=256)
+        # dim берётся из конфига, а не зашит: при TIME_DIM != 256 захардкоженное
+        # значение молча рассогласовалось бы с nn.Linear в TimeEmbedding.
+        t_emb = sinusoidal_embedding(t, dim=self.time_dim)
         t_emb = self.time_emb(t_emb)
 
         x = self.init_conv(x)

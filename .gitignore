@@ -4,3 +4,10 @@
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+# macOS
+.DS_Store
+
+# venvs / caches
+.venv/
+venv/
+.pytest_cache/

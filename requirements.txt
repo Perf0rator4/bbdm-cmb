@@ -1,7 +1,11 @@
 torch>=2.0
 numpy
 astropy
-pixell
 scikit-image
 tqdm
 matplotlib
+
+# used only by the preprocessing notebooks (tiling / reprojection)
+pixell
+healpy
+reproject

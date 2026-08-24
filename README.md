@@ -1,24 +1,87 @@
 # BBDM for CMB Super-Resolution
 
-Brownian Bridge Diffusion Model (BBDM) for enhancing Planck microwave sky maps using paired ACT+Planck observations as ground truth. Part of a broader project on galaxy cluster detection via the Sunyaev–Zeldovich effect.
+Brownian Bridge Diffusion Model (BBDM, [Li et al., CVPR 2023](https://arxiv.org/abs/2205.07680))
+for enhancing Planck microwave sky maps using paired ACT+Planck observations as
+ground truth. Part of a broader project on galaxy cluster detection via the
+Sunyaev–Zel'dovich effect.
 
-> **Status:** Training pipeline complete. Two implementation bugs identified and fixed (bridge direction mismatch + subsampling coefficient mismatch). Retraining in progress.
+> **Status:** the sampler and metric bugs that dominated earlier results are
+> fixed and covered by tests. The current run targets **spectral fidelity**
+> (Transfer Function ≈ 1 *together with* high cross-correlation `r_ℓ`), not just
+> pixel-space scores.
 
 ---
 
 ## Overview
 
-The model learns a stochastic mapping from low-resolution **Planck** patches (100 GHz) to high-resolution **ACT+Planck** patches (90 GHz) using a Brownian Bridge diffusion process. Unlike standard conditional DDPMs, BBDM pins the forward process at both endpoints — the source image at `t=0` and the target image at `t=T` — which is a more natural formulation for paired image translation.
+The model learns a stochastic mapping from low-resolution **Planck** patches
+(100 GHz) to high-resolution **ACT+Planck** patches (90 GHz) through a Brownian
+Bridge diffusion process. Unlike a standard conditional DDPM, BBDM pins the
+forward process at both endpoints, which is a more natural formulation for
+paired image translation.
+
+**Direction convention** — the single most important thing to keep straight:
+
+```
+t = 0  ->  y   ACT+Planck   (generation target)
+t = T  ->  x0  Planck       (conditional input)
+```
+
+`x0` in the code means "the Planck patch", *not* "the model's own t=0 state".
+The target never enters `BBDM.sample()`; the sampler's signature has no
+parameter for it, and a test enforces that.
+
+Forward process and schedule (`s` = `S_VAR`):
+
+```
+m_t     = t / T
+delta_t = 2 * s * (m_t - m_t**2)
+x_t     = (1 - m_t) * y + m_t * x0 + sqrt(delta_t) * eps
+```
+
+The network predicts the clean target directly (x0-parametrization), so the
+reverse step contracts the current state before adding the prediction:
+
+```
+x_{t_prev} = (c_xt - c_et) * x_t + c_et * pred + c_yt * y_cond
+             + sqrt(delta_tilde) * z
+```
+
+`c_xt` comes from the paper's eps-parametrization and already absorbs a `+c_et`
+term; dropping the subtraction double-counts the signal on every one of the ~200
+sampling steps and inflates amplitude geometrically.
+
+---
+
+## Loss
+
+```
+L = MSE(pred, y) + spectral_weight * L1( log RAPSD(pred), log RAPSD(y) )
+```
+
+Plain MSE pulls predictions toward the conditional mean, which is smoother than
+any single true realization, so high-ℓ power is under-produced. The spectral
+term penalizes that deviation directly, on the *same* Hanning-windowed, radially
+binned spectrum that `metrics/power_spectrum.py` later measures — so `TF ≈ 1`
+becomes a consequence of the training objective rather than a coincidence.
+Spectra are averaged over the batch before comparison: the goal is matching
+*ensemble* power, not the χ²-noisy spectrum of each individual realization.
+
+`ETA` (noise injected into the reverse process's start state) is **0**, matching
+the original paper's `x_T = y`. It is not a knob for fixing TF — see the note in
+[CLAUDE.md](CLAUDE.md) on why the earlier `ETA=0.01` merely cancelled two
+opposite defects.
 
 ---
 
 ## Requirements
 
 ```bash
-pip install torch numpy astropy pixell scikit-image tqdm matplotlib
+pip install -r requirements.txt
 ```
 
-Trained on Google Colab Pro+ with an NVIDIA A40 (40 GB VRAM). Batch size 32 requires ~18 GB VRAM — reduce `BATCH_SIZE` in `config.py` if needed.
+Trained on Google Colab Pro+ with an NVIDIA A40 (40 GB). Batch size 32 needs
+~18 GB VRAM — lower `BATCH_SIZE` in `config.py` if needed.
 
 ---
 
@@ -33,51 +96,72 @@ Trained on Google Colab Pro+ with an NVIDIA A40 (40 GB VRAM). Batch size 32 requ
 - ACT+Planck maps: [Naess et al. 2020](https://doi.org/10.1088/1475-7516/2020/12/046)
 - Galactic mask: [Chandran et al. 2023](https://doi.org/10.5281/zenodo.7947597)
 
-Download the data and set the paths in `config.py` before running.
+960×960 tiles are cut into four 480×480 patches. A patch pair is dropped if
+either side has more than `MAX_ZERO_FRAC` masked pixels, **or** if the Planck
+and ACT valid masks disagree on more than `MAX_MASK_MISMATCH_FRAC` of pixels —
+the two instruments have different footprints, and a patch valid in only one of
+them teaches the network to reconstruct a mask edge instead of sky.
+
+Splits are made at the **tile** level before patching: the four patches of a
+tile are adjacent on the sky, so a patch-level split would leak nearly identical
+sky between train and test.
 
 ---
 
-## Project Structure
+## Project structure
 
 ```
 bbdm-cmb/
 ├── README.md
+├── CLAUDE.md                      # working context: history, diagnosis, next steps
 ├── requirements.txt
-├── .gitignore
 │
-├── bbdm/                          # Core model and training code
-│   ├── __init__.py
-│   ├── config.py                  # All hyperparameters and paths
-│   ├── bbdm.py                    # Brownian Bridge Diffusion Model
-│   ├── unet.py                    # U-Net backbone (33M parameters)
-│   ├── dataset.py                 # CMBPatchDataset, tiling, normalisation
-│   ├── splits.py                  # Train/val/test tile splits
-│   ├── train.py                   # Training loop with EMA
-│   ├── sample.py                  # Inference and visualisation
-│   └── power_spectrum.py          # RAPSD and Transfer Function metrics
+├── bbdm/
+│   ├── config.py                  # paths and hyperparameters
+│   ├── train.py                   # training loop, EMA, deterministic validation
+│   ├── sample.py                  # inference and visualisation
+│   ├── evaluate.py                # TF / r_ell / PSNR / SSIM averaged over patches
+│   ├── model/
+│   │   ├── bbdm.py                # bridge, loss, sampler
+│   │   └── unet.py                # U-Net backbone (33M parameters)
+│   ├── data/
+│   │   ├── dataset.py             # CMBPatchDataset, tiling, normalisation
+│   │   └── splits.py              # tile-level train/val/test splits
+│   └── metrics/
+│       └── power_spectrum.py      # RAPSD, Transfer Function, cross-correlation
 │
-└── notebooks/                     # Jupyter notebooks for workflows
-    ├── batching_planck.ipynb 
-    ├── matching_planck_and_act.ipynb 
-    └── training+inference.ipynb 
+├── tests/
+│   ├── test_bbdm_math.py          # bridge/sampler/metric math (no data needed)
+│   └── test_dataset.py            # patch filters, normalisation, augmentation
+│
+└── notebooks/
+    ├── batching_planck.ipynb      # tiling the full-sky maps
+    ├── matching_planck_and_act.ipynb  # reprojection / footprint matching
+    └── training+inference.ipynb   # main workflow
 ```
+
+---
+
 ## Quickstart
 
-**1. Set paths in `config.py`:**
+**1. Set paths** in `bbdm/config.py` (or override them in the notebook):
+
 ```python
 PLANCK_DIR     = "/path/to/planck/tiles"
 ACT_DIR        = "/path/to/act_planck/tiles"
 CHECKPOINT_DIR = "/path/to/checkpoints"
 ```
 
-**2. Run the Colab notebook end-to-end:**
+**2. Run the tests** — no data required, a few seconds on CPU:
 
-Open `training+inference.ipynb` in Google Colab. The notebook covers:
-- Data loading and sanity checks
-- Model initialisation
-- Training (100 epochs, 32 hours on A40)
-- Inference with 3 stochastic samples
-- RAPSD and Transfer Function evaluation
+```bash
+python tests/test_bbdm_math.py && python tests/test_dataset.py
+```
+
+**3. Run `notebooks/training+inference.ipynb` end to end.** It covers data
+loading and sanity checks, training (100 epochs, ~32 h on an A40, resumable via
+`last.pt`), inference with three stochastic samples, the TF / `r_ℓ` evaluation
+averaged over 50 patches, and the ETA ablation.
 
 ---
 
@@ -100,36 +184,69 @@ Open `training+inference.ipynb` in Google Colab. The notebook covers:
 |-----------|-------|
 | Optimiser | Adam |
 | Learning rate | 1e-4 |
-| LR schedule | ReduceLROnPlateau ×0.5, patience 3000 |
+| LR schedule | ReduceLROnPlateau ×0.5, patience 5 **epochs** |
 | Batch size | 32 |
 | Epochs | 100 |
-| EMA decay | 0.995 |
-| Diffusion steps T | 1000 |
-| Sampling steps S | 200 |
-| Bridge scale s | 0.5 |
+| EMA decay / start | 0.995 / step 10000 |
+| Diffusion steps `T` | 1000 |
+| Sampling steps `S` | 200 |
+| Bridge scale `s` | 0.5 |
+| Start noise `ETA` | 0.0 |
+| `spectral_weight` | 0.1 |
+
+`SCHEDULER_PATIENCE` is in epochs because the scheduler is stepped once per
+epoch. The paper's value of 3000 is in optimizer *steps*; copied verbatim it
+meant the LR never decayed across a 100-epoch run.
 
 ---
 
-## Results
+## Evaluating results
 
-Current results (pre-bugfix checkpoint):
+Read `TF` and `r_ℓ` together, always averaged over ≥30–60 patches:
 
-| Metric | Value |
-|--------|-------|
-| PSNR | 2.78 ± 0.64 dB |
-| SSIM | 0.0148 ± 0.0092 |
-| Transfer Function | 8–120× (ideal: 1.0) |
+```python
+from bbdm.evaluate import evaluate_spectra, print_band_table, plot_spectral_comparison
 
-Low scores are caused by two implementation bugs (now fixed) rather than fundamental model failure. Visual inspection shows the model correctly reproduces large-scale CMB structure.
+res = evaluate_spectra(bbdm, val_ds, mu, sigma, n_patches=50, S=200, device="cuda")
+print_band_table(res)
+plot_spectral_comparison([res], ["ETA=0 + spectral loss"])
+```
 
+Two rules that changed conclusions in this project:
+
+- **Never judge a spectrum from one patch.** At high ℓ the power is small and a
+  single-patch estimate swings enough that a real systematic and pure estimator
+  noise look identical.
+- **Average the spectra, then divide.** Averaging per-patch ratios blows up when
+  any patch has near-zero target power in a bin.
+
+`TF ≈ 1` on its own proves nothing: power that is spectrally right but spatially
+uncorrelated with the target (white noise, hallucinated point sources) gives
+`TF ≈ 1` with a collapsing `r_ℓ`. `evaluate_spectra` returns both, and
+`plot_spectral_comparison` puts them side by side for exactly this reason.
+
+Changing `BBDM.sample` / `_posterior_coeffs` is sampling-only and can be tested
+by re-sampling an existing checkpoint (that is how the ETA and S ablations work —
+`evaluate_spectra(eta=...)` swaps it temporarily). Changing `BBDM.loss` or
+`BBDM.q_sample` changes what the network is trained to predict and requires a
+full retrain.
 
 ---
 
-## Known Issues (Fixed)
+## Fixed bugs
 
-**Bug 1 — Bridge direction mismatch:** The reverse process was initialised from `x_T ≈ x0` (Planck) instead of `x_T ≈ y` (ACT+Planck), causing an out-of-distribution mismatch at every inference step.
+Each of these is covered by a regression test in `tests/`.
 
-**Bug 2 — Subsampling coefficient mismatch:** Posterior coefficients were precomputed assuming step size Δt=1, but inference used S=200 steps with effective Δt≈5. Fixed by computing coefficients dynamically per step in `_posterior_coeffs()`.
-
----
-
+| Bug | Symptom | Fix |
+|-----|---------|-----|
+| Bridge direction inverted | Target leaked into inference; model solved the inverse task | Direction convention above; `sample()` takes only Planck |
+| Mixed parametrization in the sampler | TF inflated 25–120×; oracle model recovered ×6.58 amplitude | Contract with `(c_xt - c_et)` before adding `c_et * pred` |
+| Sampler conditioned on the noisy start state | Every step's `c_yt` term used `x_T` instead of clean input | `sample()` keeps a separate clean `y_cond` |
+| First-step degeneracy at `t=T` | `m_t = 1` made 0/0 drop the model's prediction entirely | `m_t.clamp(max=1-1e-4)`, verified against the analytic limit |
+| LR scheduler never fired | `patience=3000` epochs on a 100-epoch run | `SCHEDULER_PATIENCE = 5` epochs |
+| EMA staleness | Early "best" checkpoints stored near-initialization weights in the `ema` branch | Snapshot live weights into the shadow at `ema_start` |
+| Biased `r_ℓ` estimator | Per-pixel ratio averaged per bin; no window on the cross term | Bin numerator and both spectra first, divide after; same Hanning window throughout |
+| Normalization loaded every pixel into RAM | ~5 GB temporary array over the train split | Streaming sum / sum-of-squares |
+| Augmentation materialized 4× copies | ~19 GB of patches held in RAM | Applied on the fly in `__getitem__` |
+| Stochastic validation loss | Best-checkpoint choice and `ReduceLROnPlateau` driven by estimator noise | Fixed seed for `t` and bridge noise in validation |
+| Per-panel autoscaling in plots | Amplitude error invisible in every figure | Shared colour scale taken from the target |

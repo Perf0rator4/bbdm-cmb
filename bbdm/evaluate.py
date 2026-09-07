@@ -279,3 +279,192 @@ def evaluate_image_metrics(
         "ssim_std": float(np.std(ssim_list)),
         "n_patches": len(psnr_list),
     }
+
+
+# --------------------------------------------------------------- диагностика
+
+
+@torch.no_grad()
+def _mean_target_rapsd(bbdm, dataset, indices, batch_size, device):
+    """Средний RAPSD цели в НОРМАЛИЗОВАННЫХ единицах, бинами BBDM.rapsd."""
+    total, n = None, 0
+    for _, y in _iter_batches(dataset, indices, batch_size):
+        ps = bbdm.rapsd(y.to(device))
+        total = ps if total is None else total + ps
+        n += 1
+    return total / max(n, 1)
+
+
+@torch.no_grad()
+def bridge_snr(
+    bbdm, dataset, n_patches=32, batch_size=8, device="cpu",
+    bands=DEFAULT_BANDS, indices=None,
+):
+    """Сколько сигнала на каждом ell переживает шум моста, как функция t.
+
+    Мост подмешивает **белый** шум с пиксельной дисперсией
+    `delta_t = 2*s*m_t*(1-m_t)`, тогда как сигнальная компонента в `x_t`
+    равна `(1-m_t)*y`. Спектр CMB+ACT падает на ~6 порядков от низких ell к
+    высоким, поэтому плоский шумовой пол хоронит высокие ell почти при
+    любом t. Доля t, при которых мода ещё различима, и есть доля обучающих
+    шагов, на которых сеть вообще может чему-то научиться на этом масштабе.
+
+    Это количественное обоснование пункта 7.2 (частотно-зависимое
+    расписание `delta_t`): при скалярном расписании отношение сигнал/шум
+    на высоких ell задано целиком спектром данных, а не выбором модели.
+
+    Returns:
+        dict с freqs, snr (матрица t x bin), t_values, полосными долями
+        `frac_usable` и `best_snr`.
+    """
+    if indices is None:
+        indices = list(range(min(n_patches, len(dataset))))
+
+    bbdm = bbdm.to(device).eval()
+    ps_target = _mean_target_rapsd(bbdm, dataset, indices, batch_size, device)
+    ps_target = ps_target.cpu().numpy()
+
+    # Белый шум с дисперсией v, пропущенный через то же окно Ханна и
+    # ortho-FFT, даёт ПЛОСКИЙ спектр на уровне v * <w^2> (по Парсевалю).
+    h, w = dataset[indices[0]][0].shape[-2:]
+    window = bbdm._hann_window(h, w, torch.device(device), torch.float32)
+    w2 = float((window ** 2).mean())
+
+    t_values = np.arange(1, bbdm.T + 1)
+    m = t_values / bbdm.T
+    delta = 2 * bbdm.s * (m - m ** 2)
+
+    signal = ((1 - m) ** 2)[:, None] * ps_target[None, :]
+    noise = (delta * w2)[:, None]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        snr = np.where(noise > 0, signal / np.maximum(noise, 1e-300), 0.0)
+
+    r_max = len(ps_target)
+    freqs = np.arange(r_max) / r_max
+
+    usable = (snr > 1.0).mean(axis=0)      # доля t на каждом бине
+    return {
+        "freqs": freqs,
+        "t_values": t_values,
+        "snr": snr,
+        "ps_target": ps_target,
+        "bands": list(bands),
+        "frac_usable": band_average(usable, freqs, bands),
+        "best_snr": band_average(snr.max(axis=0), freqs, bands),
+    }
+
+
+def print_bridge_snr(result):
+    """Таблица: доля обучающих шагов, на которых полоса выше шума моста."""
+    print(f"\n{'band':>14}{'usable t':>12}{'best SNR':>12}")
+    print("  " + "-" * 36)
+    for i, (lo, hi) in enumerate(result["bands"]):
+        print(
+            f"{lo:>7.3f}-{hi:<6.2f}"
+            f"{result['frac_usable'][i] * 100:>10.1f}%"
+            f"{result['best_snr'][i]:>12.3g}"
+        )
+    print("\n  'usable t' -- доля шагов 1..T, на которых сигнал полосы выше")
+    print("  белого шума моста. Там, где она мала, сеть почти никогда не")
+    print("  видит этот масштаб неиспорченным (см. §7.2).")
+
+
+@torch.no_grad()
+def diagnose_prediction_spectrum(
+    bbdm, dataset, t_values=(1, 10, 50, 100, 250, 500, 750, 999),
+    n_patches=16, batch_size=4, device="cuda", bands=DEFAULT_BANDS,
+    indices=None, seed=0,
+):
+    """Мощность ОДНОШАГОВОГО предсказания model(x_t, t) относительно цели.
+
+    Решающая проверка того, откуда берётся избыток мощности на высоких ell.
+
+    Апостериорное среднее на моде с мощностью p равно `k_t * x_t` с
+    `k_t = (1-m)p / ((1-m)^2 p + delta_t)`. На высоких ell, где p много
+    меньше шума моста, `k_t ~ p/m` -- то есть сеть ОБЯЗАНА давить свой вход
+    в десятки раз. Если она этого не делает, белый шум моста проходит на
+    выход как есть, и `TF` выходит примерно на отношение "шум моста /
+    мощность цели", а `r_ell` падает в ноль: этот избыток по построению
+    независим от цели.
+
+    Спектральный член лосса подталкивает ровно к этому. Он сравнивает
+    спектры, усреднённые по батчу со СМЕШАННЫМИ t, то есть ограничивает
+    только среднее по t; а самый дешёвый источник высокочастотной мощности
+    для сети -- шум моста, уже присутствующий в её входе. Прекратить его
+    давить дешевле, чем синтезировать структуру.
+
+    `ideal` -- отношение для точного апостериорного среднего в режиме
+    "вход не несёт информации" (справедливо на высоких ell). На низких ell
+    это НИЖНЯЯ оценка: там Planck информативен и настоящее апостериорное
+    среднее мощнее. Диагноз подтверждается, если на высоких ell `actual`
+    много больше `ideal` и почти не убывает с ростом t.
+
+    Returns:
+        dict с t_values, ratio_bands (t x band), ideal_bands (t x band).
+    """
+    from tqdm.auto import tqdm
+
+    if indices is None:
+        indices = list(range(min(n_patches, len(dataset))))
+
+    bbdm = bbdm.to(device).eval()
+    ps_target = _mean_target_rapsd(bbdm, dataset, indices, batch_size, device)
+
+    h, w = dataset[indices[0]][0].shape[-2:]
+    window = bbdm._hann_window(h, w, torch.device(device), torch.float32)
+    w2 = float((window ** 2).mean())
+
+    ratio_bands, ideal_bands = [], []
+    freqs = np.arange(len(ps_target)) / len(ps_target)
+    ps_target_np = ps_target.cpu().numpy()
+
+    for t_val in tqdm(list(t_values), desc="one-step spectrum"):
+        total, n = None, 0
+        for b_i, (x0, y) in enumerate(_iter_batches(dataset, indices, batch_size)):
+            x0, y = x0.to(device), y.to(device)
+            g = torch.Generator(device=x0.device)
+            g.manual_seed(seed + b_i)
+            t = torch.full((x0.shape[0],), int(t_val), device=x0.device,
+                           dtype=torch.long)
+            x_t, _ = bbdm.q_sample(x0, y, t, generator=g)
+            ps = bbdm.rapsd(bbdm.model(x_t, t))
+            total = ps if total is None else total + ps
+            n += 1
+
+        ratio = (total / max(n, 1)).cpu().numpy() / (ps_target_np + 1e-20)
+        ratio_bands.append(band_average(ratio, freqs, bands))
+
+        m = int(t_val) / bbdm.T
+        delta = 2 * bbdm.s * (m - m ** 2)
+        sig = (1 - m) ** 2 * ps_target_np
+        ideal = sig / (sig + delta * w2 + 1e-20)
+        ideal_bands.append(band_average(ideal, freqs, bands))
+
+    return {
+        "t_values": list(t_values),
+        "bands": list(bands),
+        "ratio_bands": ratio_bands,
+        "ideal_bands": ideal_bands,
+        "freqs": freqs,
+    }
+
+
+def print_prediction_spectrum(result):
+    """Таблица "мощность предсказания / мощность цели" по t и полосам."""
+    bands = result["bands"]
+    head = f"{'t':>6}" + "".join(f"{f'{lo}-{hi}':>16}" for lo, hi in bands)
+    print("\nOne-step prediction power / target power   (actual | ideal)")
+    print(head)
+    print("  " + "-" * (len(head) - 2))
+    for i, t in enumerate(result["t_values"]):
+        row = "".join(
+            f"{a:>8.2f} |{b:>6.2f}"
+            for a, b in zip(result["ratio_bands"][i], result["ideal_bands"][i])
+        )
+        print(f"{t:>6}{row}")
+    print("\n  'ideal' падает к 0 с ростом t -- при большом t апостериорное")
+    print("  среднее ОБЯЗАНО быть гладким, потому что шум моста хоронит")
+    print("  высокие ell. Если 'actual' там много больше 'ideal' и почти не")
+    print("  убывает с t, сеть пропускает белый шум моста на выход вместо")
+    print("  того, чтобы его давить: это и есть источник избытка мощности,")
+    print("  и он по построению не коррелирует с целью (r_ell -> 0).")

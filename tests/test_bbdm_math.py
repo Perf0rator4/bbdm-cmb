@@ -10,6 +10,7 @@ BBDM.sample() подаётся фейковая "модель", возвраща
 которое раньше раздувало Transfer Function в десятки раз.
 """
 
+import math
 import os
 import sys
 
@@ -309,6 +310,51 @@ def test_sample_step_deduplication():
     bbdm = BBDM(OracleModel(y), T=20, s=S_VAR, eta=0.0).eval()
     bbdm.sample(x0, S=100)
     assert len(bbdm.model.seen_std) == 20, "шагов не больше, чем T"
+
+
+# ------------------------------------------------- шум моста и диагностика
+
+
+def test_bridge_noise_floor_is_flat_at_variance_times_window():
+    """Белый шум дисперсии v через окно Ханна и ortho-FFT даёт плоский пол v*<w^2>.
+
+    На этой формуле держится evaluate.bridge_snr: она задаёт, с чем именно
+    сравнивается сигнал на каждом ell.
+    """
+    bbdm = _make(torch.zeros(1, 1, 64, 64))
+    v = 0.37
+    g = torch.Generator().manual_seed(14)
+    white = torch.randn(64, 1, 64, 64, generator=g) * math.sqrt(v)
+
+    ps = bbdm.rapsd(white)[1:]
+    window = bbdm._hann_window(64, 64, torch.device("cpu"), torch.float32)
+    expected = v * float((window ** 2).mean())
+
+    assert abs(float(ps.mean()) / expected - 1) < 0.05
+    assert float(ps.std() / ps.mean()) < 0.15, "пол должен быть плоским"
+
+
+def test_posterior_mean_must_attenuate_faint_modes():
+    """На моде слабее шума моста апостериорное среднее сильно давит вход.
+
+    k_t = (1-m)p / ((1-m)^2 p + delta_t). При p << delta это ~ p/m, то есть
+    сеть обязана ослаблять вход в десятки раз; тождественное отображение
+    пропустило бы шум моста на выход. Ровно это и измеряет
+    evaluate.diagnose_prediction_spectrum.
+    """
+    T, s = 1000, 0.5
+    for t in (250, 500, 750):
+        m = t / T
+        delta = 2 * s * (m - m ** 2)
+        for p in (1e-2, 1e-3):
+            k = (1 - m) * p / ((1 - m) ** 2 * p + delta)
+            assert k < 0.2, f"k={k:.3f} при p={p}, t={t} -- должно сильно давить"
+
+    # а на моде с мощностью, сравнимой с полной дисперсией, k близок к 1
+    m = 0.5
+    delta = 2 * s * (m - m ** 2)
+    k = (1 - m) * 1.0 / ((1 - m) ** 2 * 1.0 + delta)
+    assert abs(k - 1.0) < 1e-9
 
 
 if __name__ == "__main__":

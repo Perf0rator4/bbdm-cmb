@@ -1,8 +1,4 @@
-"""Проверки пути данных: фильтры патчей, нормализация, аугментации.
 
-Работает на синтетических FITS во временной папке -- реальные тайлы не нужны.
-Запуск: `pytest tests/` или `python tests/test_dataset.py`.
-"""
 
 import os
 import shutil
@@ -15,7 +11,7 @@ from astropy.io import fits
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bbdm.data.dataset import (  # noqa: E402
+from bbdm.data.dataset import (
     CMBPatchDataset,
     compute_normalization,
     tile_to_patches,
@@ -89,8 +85,7 @@ def test_mask_mismatch_filter_drops_planck_only_hole():
     высокочастотную мощность.
     """
     planck, act = _clean_tile(1), _clean_tile(2)
-    # 10% нижне-правого патча -- ниже MAX_ZERO_FRAC, так что отсеять его
-    # может ТОЛЬКО фильтр рассогласования масок.
+
     planck[-21:, -20:] = 0.0
 
     kept = _dataset(planck, act, max_zero_frac=0.2, max_mask_mismatch_frac=0.01)
@@ -113,7 +108,7 @@ def test_matching_masks_survive_the_filter():
 def test_zero_fraction_filter():
     planck, act = _clean_tile(5), _clean_tile(6)
     planck[:PATCH, :PATCH] = 0.0
-    act[:PATCH, :PATCH] = 0.0  # маски согласованы, срабатывает только zero-frac
+    act[:PATCH, :PATCH] = 0.0 
 
     ds = _dataset(planck, act, max_zero_frac=0.2, max_mask_mismatch_frac=0.01)
     assert len(ds.pairs) == 3

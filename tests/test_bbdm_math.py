@@ -1,14 +1,3 @@
-"""Проверки математики моста, сэмплера и спектральных метрик.
-
-Запуск: `pytest tests/` или `python tests/test_bbdm_math.py`.
-Данные не нужны -- всё на синтетике, работает на CPU за секунды.
-
-Ключевой тест здесь -- oracle-тест сэмплера (test_sampler_oracle_*): в
-BBDM.sample() подаётся фейковая "модель", возвращающая точную цель, и
-проверяется, что амплитуда на выходе совпадает с целью ровно, а траектория
-не разгоняется. Именно этот тест ловит смешение eps- и x0-параметризации,
-которое раньше раздувало Transfer Function в десятки раз.
-"""
 
 import math
 import os
@@ -25,8 +14,8 @@ from bbdm.metrics.power_spectrum import (  # noqa: E402
     cross_correlation,
     transfer_function,
 )
-from bbdm.model.bbdm import BBDM  # noqa: E402
-from bbdm.model.unet import UNet  # noqa: E402
+from bbdm.model.bbdm import BBDM  
+from bbdm.model.unet import UNet  
 
 T_STEPS = 1000
 S_VAR = 0.5
@@ -55,12 +44,11 @@ def _make(target, eta=0.0):
 
 def _random_pair(b=2, h=32, w=32, seed=0):
     g = torch.Generator().manual_seed(seed)
-    y = torch.randn(b, 1, h, w, generator=g)          # ACT+Planck, цель
+    y = torch.randn(b, 1, h, w, generator=g)       
     x0 = torch.randn(b, 1, h, w, generator=g) * 0.8   # Planck, вход
     return x0, y
 
 
-# --------------------------------------------------------------- q_sample --
 
 
 def test_q_sample_endpoints():
@@ -74,7 +62,6 @@ def test_q_sample_endpoints():
 
     t_1 = torch.ones(x0.shape[0], dtype=torch.long)
     x_1, _ = bbdm.q_sample(x0, y, t_1)
-    # m_1 = 1e-3, delta_1 = 1e-3 -> отклонение от y порядка 0.03 по std
     assert (x_1 - y).std() < 0.1, "x_1 должен быть близок к ACT+Planck"
 
 
@@ -95,7 +82,6 @@ def test_q_sample_moments_monte_carlo():
         assert abs(float(draws.var(0).mean()) - d) < 0.02, f"var @ t={t_val}"
 
 
-# --------------------------------------------------- коэффициенты обратного
 
 
 def test_posterior_final_step_returns_prediction():
@@ -119,7 +105,6 @@ def test_posterior_first_step_limit():
     c_x, c_y, c_e, d_tilde = bbdm._posterior_coeffs(t, t_prev)
 
     m_prev = (T_STEPS - 5) / T_STEPS
-    # предел: x_{T-1} = m_{T-1} * planck + (1 - m_{T-1}) * pred + шум
     assert abs(float(c_x - c_e) - m_prev) < 1e-3
     assert abs(float(c_e) - (1 - m_prev)) < 1e-3
     assert abs(float(c_y)) < 1e-3
@@ -140,7 +125,6 @@ def test_posterior_first_step_limit_is_clamp_independent():
         assert abs(a - b) < 5e-3
 
 
-# -------------------------------------------------------- oracle-тест сэмплера
 
 
 def test_sampler_oracle_reproduces_target():
@@ -163,7 +147,6 @@ def test_sampler_oracle_trajectory_does_not_blow_up():
 
     seen = bbdm.model.seen_std
     assert len(seen) == 50
-    # На мосту std(x_t) ~ 1 плюс не больше sqrt(max delta_t) = sqrt(0.25).
     assert max(seen) < 3.0, f"траектория разгоняется: max std = {max(seen):.2f}"
 
 
@@ -259,11 +242,9 @@ def test_cross_correlation_of_independent_maps_is_small():
     a = rng.standard_normal((128, 128))
     b = rng.standard_normal((128, 128))
     r_ell, freqs = cross_correlation(a, b)
-    # на высоких ell в бине много мод, оценка должна быть близка к нулю
     assert abs(float(np.mean(r_ell[freqs > 0.3]))) < 0.1
 
 
-# ---------------------------------------------------------------- сквозное
 
 
 def test_unet_forward_shape_and_time_dim():
@@ -312,15 +293,10 @@ def test_sample_step_deduplication():
     assert len(bbdm.model.seen_std) == 20, "шагов не больше, чем T"
 
 
-# ------------------------------------------------- шум моста и диагностика
 
 
 def test_bridge_noise_floor_is_flat_at_variance_times_window():
-    """Белый шум дисперсии v через окно Ханна и ortho-FFT даёт плоский пол v*<w^2>.
 
-    На этой формуле держится evaluate.bridge_snr: она задаёт, с чем именно
-    сравнивается сигнал на каждом ell.
-    """
     bbdm = _make(torch.zeros(1, 1, 64, 64))
     v = 0.37
     g = torch.Generator().manual_seed(14)
@@ -335,13 +311,7 @@ def test_bridge_noise_floor_is_flat_at_variance_times_window():
 
 
 def test_posterior_mean_must_attenuate_faint_modes():
-    """На моде слабее шума моста апостериорное среднее сильно давит вход.
 
-    k_t = (1-m)p / ((1-m)^2 p + delta_t). При p << delta это ~ p/m, то есть
-    сеть обязана ослаблять вход в десятки раз; тождественное отображение
-    пропустило бы шум моста на выход. Ровно это и измеряет
-    evaluate.diagnose_prediction_spectrum.
-    """
     T, s = 1000, 0.5
     for t in (250, 500, 750):
         m = t / T

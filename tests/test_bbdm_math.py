@@ -9,13 +9,17 @@ import torch.nn as nn
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from bbdm.evaluate import (  # noqa: E402
+    axis_vs_diagonal_power,
+    diagnose_trajectory_spectrum,
+)
 from bbdm.metrics.power_spectrum import (  # noqa: E402
     compute_power_spectrum,
     cross_correlation,
     transfer_function,
 )
-from bbdm.model.bbdm import BBDM  
-from bbdm.model.unet import UNet  
+from bbdm.model.bbdm import BBDM
+from bbdm.model.unet import UNet
 
 T_STEPS = 1000
 S_VAR = 0.5
@@ -325,6 +329,148 @@ def test_posterior_mean_must_attenuate_faint_modes():
     delta = 2 * s * (m - m ** 2)
     k = (1 - m) * 1.0 / ((1 - m) ** 2 * 1.0 + delta)
     assert abs(k - 1.0) < 1e-9
+
+
+# ------------------------------------------------- Фаза 0: exposure bias и
+# ------------------------------------------------- направленные артефакты
+
+
+class _TinyPairDataset:
+    """Игрушечный датасет пар (Planck, ACT) для тестов evaluate.py."""
+
+    def __init__(self, n, size=16, seed=0):
+        g = torch.Generator().manual_seed(seed)
+        self.items = [
+            (torch.randn(1, size, size, generator=g),
+             torch.randn(1, size, size, generator=g))
+            for _ in range(n)
+        ]
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, i):
+        return self.items[i]
+
+
+def test_trajectory_diagnostic_matches_sampler_output():
+    """diagnose_trajectory_spectrum дублирует цикл BBDM.sample() -- сверяем побитово.
+
+    Функция пишет собственную копию цикла обратного процесса, чтобы
+    прочитать промежуточные (t, pred), которые sample() не отдаёт. Копия
+    рискует разъехаться с продакшн-кодом при следующей правке sample() --
+    этот тест обязан упасть, если это случится: с одинаковым сидом и
+    одним патчем в батче финальное состояние обеих реализаций должно
+    совпасть побитово.
+    """
+    x0, y = _random_pair(b=1, h=16, w=16, seed=20)
+    bbdm = _make(y, eta=0.0).eval()
+
+    seed = 777
+    g_ref = torch.Generator().manual_seed(seed)
+    reference = bbdm.sample(x0, S=20, generator=g_ref)
+
+    class _OneItemDataset:
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, i):
+            return x0[0], y[0]
+
+    result = diagnose_trajectory_spectrum(
+        bbdm, _OneItemDataset(), t_probe=(1000, 500, 1), n_patches=1,
+        batch_size=1, device="cpu", S=20, seed=seed,
+    )
+
+    assert torch.allclose(result["last_batch_final_x_t"], reference, atol=1e-6)
+
+
+def test_trajectory_diagnostic_matches_sampler_with_eta():
+    """То же самое, но с eta>0 -- проверяет ветку стартового шума отдельно."""
+    x0, y = _random_pair(b=1, h=16, w=16, seed=21)
+    bbdm = _make(y, eta=0.02).eval()
+
+    seed = 321
+    g_ref = torch.Generator().manual_seed(seed)
+    reference = bbdm.sample(x0, S=15, generator=g_ref)
+
+    class _OneItemDataset:
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, i):
+            return x0[0], y[0]
+
+    result = diagnose_trajectory_spectrum(
+        bbdm, _OneItemDataset(), t_probe=(1000, 1), n_patches=1,
+        batch_size=1, device="cpu", S=15, seed=seed,
+    )
+    assert torch.allclose(result["last_batch_final_x_t"], reference, atol=1e-6)
+
+
+def test_axis_vs_diagonal_power_detects_directional_excess():
+    """Синтетическая проверка: изотропный вход -> ratio~1, осевой -> ratio>>1."""
+    h = w = 128
+    rng = np.random.default_rng(0)
+    bands = [(0.2, 0.9)]
+
+    isotropic = rng.random((h, w)) + 0.5
+    ratio_iso = axis_vs_diagonal_power(isotropic, bands)[0]
+    assert abs(ratio_iso - 1.0) < 0.3, f"изотропный шум не должен давать анизотропию: {ratio_iso}"
+
+    axis_biased = isotropic.copy()
+    cy, cx = h // 2, w // 2
+    axis_biased[cy - 2 : cy + 2, :] += 50.0
+    axis_biased[:, cx - 2 : cx + 2] += 50.0
+
+    ratio_axis = axis_vs_diagonal_power(axis_biased, bands)[0]
+    assert ratio_axis > 3.0, f"добавленная осевая мощность должна быть обнаружена: {ratio_axis}"
+
+
+def test_evaluate_diagnostics_api_smoke():
+    """API-прогон новых функций Фазы 0 на игрушечных данных.
+
+    Проверяет только отсутствие ошибок в сигнатурах/индексации/форматировании
+    таблиц -- за физику отвечают test_trajectory_diagnostic_matches_sampler_*
+    и test_axis_vs_diagonal_power_detects_directional_excess выше.
+    """
+    from bbdm.evaluate import (
+        compute_2d_power_spectrum,
+        diagnose_prediction_spectrum,
+        evaluate_spectra,
+        print_anisotropy_table,
+        print_tf_across_S,
+        print_trajectory_spectrum,
+        print_trajectory_vs_qsample,
+    )
+
+    net = UNet(in_ch=1, base_ch=8, time_dim=64, groups=4)
+    bbdm = BBDM(net, T=100, s=0.5, eta=0.0).eval()
+    ds = _TinyPairDataset(3, size=16)
+    bands = [(0.2, 0.9)]
+
+    spec2d = compute_2d_power_spectrum(bbdm, ds, n_patches=3, batch_size=2,
+                                       device="cpu", S=5)
+    assert spec2d["pred"].shape == (16, 16)
+    print_anisotropy_table(spec2d, bands=bands)
+
+    traj = diagnose_trajectory_spectrum(
+        bbdm, ds, t_probe=(100, 50, 1), n_patches=3, batch_size=2,
+        device="cpu", S=5, bands=bands,
+    )
+    print_trajectory_spectrum(traj)
+
+    qsample = diagnose_prediction_spectrum(
+        bbdm, ds, t_values=(100, 50, 1), n_patches=3, batch_size=2,
+        device="cpu", bands=bands,
+    )
+    print_trajectory_vs_qsample(traj, qsample)
+
+    res_a = evaluate_spectra(bbdm, ds, mu=0.0, sigma=1.0, n_patches=3, S=5,
+                             device="cpu", batch_size=2, progress=False)
+    res_b = evaluate_spectra(bbdm, ds, mu=0.0, sigma=1.0, n_patches=3, S=10,
+                             device="cpu", batch_size=2, progress=False)
+    print_tf_across_S({5: res_a, 10: res_b})
 
 
 if __name__ == "__main__":

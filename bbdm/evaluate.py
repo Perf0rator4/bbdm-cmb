@@ -11,6 +11,7 @@
 """
 
 import contextlib
+import math
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -222,6 +223,42 @@ def plot_spectral_comparison(results_list, labels, title=None):
     plt.tight_layout()
     plt.show()
     return fig
+
+
+def print_tf_across_S(results_by_S, bands=None):
+    """TF и r_ell рядом для нескольких S (число шагов сэмплирования).
+
+    Каждый `results_by_S[S]` -- результат `evaluate_spectra(..., S=S)` на
+    ОДНОМ И ТОМ ЖЕ чекпоинте и тех же `indices`/`seed`; менять S не требует
+    переобучения, только пересэмплирования.
+
+    Диагностика: если избыток мощности на высоких ell накапливается вдоль
+    цепочки обратного процесса (каждый шаг понемногу усиливает то, что
+    сеть уже видит), TF должна заметно падать с уменьшением S -- цепочка
+    короче, накопиться нечему. Если же избыток возникает независимо от
+    траектории (сеть один раз "досочиняет" недостающую мощность), TF
+    должна быть почти не чувствительна к S. Первый случай означает, что
+    сэмплирование с меньшим S -- бесплатное немедленное смягчение, пока
+    готовится исправление обучения (§7.2); второй случай означает, что S
+    тут ни при чём и снижать его бессмысленно.
+    """
+    Ss = sorted(results_by_S)
+    bands = bands or results_by_S[Ss[0]]["bands"]
+
+    for label, key in (("Transfer Function", "tf_bands"), ("r_ell", "r_bands")):
+        head = f"{'band':>14}" + "".join(f"{f'S={s}':>10}" for s in Ss)
+        print(f"\n{label} vs число шагов сэмплирования S")
+        print(head)
+        print("  " + "-" * (len(head) - 2))
+        for i, (lo, hi) in enumerate(bands):
+            row = "".join(f"{results_by_S[s][key][i]:>10.3f}" for s in Ss)
+            print(f"{lo:.3f}-{hi:<6.2f}{row}")
+
+    print("\n  Плоско по S -> избыток не зависит от длины траектории (сеть")
+    print("  синтезирует мощность за один шаг, вне зависимости от S).")
+    print("  Резко падает с уменьшением S -> избыток НАКАПЛИВАЕТСЯ вдоль")
+    print("  цепочки -- тогда меньший S снижает его уже сейчас, без")
+    print("  переобучения (но и без устранения первопричины).")
 
 
 @torch.no_grad()
@@ -468,3 +505,329 @@ def print_prediction_spectrum(result):
     print("  убывает с t, сеть пропускает белый шум моста на выход вместо")
     print("  того, чтобы его давить: это и есть источник избытка мощности,")
     print("  и он по построению не коррелирует с целью (r_ell -> 0).")
+
+
+@torch.no_grad()
+def diagnose_trajectory_spectrum(
+    bbdm, dataset, t_probe=(999, 750, 500, 250, 100, 50, 10, 1),
+    n_patches=16, batch_size=4, device="cuda", bands=DEFAULT_BANDS,
+    indices=None, seed=0, S=200,
+):
+    """Мощность одношагового предсказания на РЕАЛЬНОЙ траектории сэмплера.
+
+    `diagnose_prediction_spectrum` кормит сеть состояниями `q_sample(x0, y, t)`
+    -- то есть распределением ОБУЧЕНИЯ. На инференсе сеть вместо этого видит
+    то, что накопила цепочка к этому шагу, и это состояние может уже нести
+    избыток, добавленный сетью же на предыдущих шагах. Эта функция
+    прогоняет НАСТОЯЩИЙ обратный процесс (тот же код, что в `BBDM.sample()`)
+    один раз на батч и записывает одношаговую мощность предсказания в
+    шагах, ближайших к каждому запрошенному `t_probe`, -- чтобы сравнить
+    напрямую с in-distribution диагностикой при (почти) тех же t.
+
+    Цикл ниже ДУБЛИРУЕТ `BBDM.sample()`, а не вызывает его, потому что ему
+    нужно читать пары (t, pred) в середине цепочки, которые `sample()` не
+    отдаёт наружу. Это создаёт риск разъехаться с продакшн-кодом при
+    следующей правке `sample()` -- поэтому
+    `tests/test_bbdm_math.py::test_trajectory_diagnostic_matches_sampler_output`
+    требует, чтобы при одинаковом сиде эта функция и `bbdm.sample()` давали
+    ПОБИТОВО одинаковый финальный `x_t`; тест обязан падать при любом
+    расхождении в копии цикла.
+
+    Returns:
+        dict с requested_t, actual_t (реально посещённый ближайший шаг),
+        ratio_bands (мощность выхода / мощность цели, t x band) и
+        input_ratio_bands (мощность ВХОДНОГО состояния / мощность цели,
+        t x band) -- сравнение двух рядов показывает, усиливает ли сеть
+        уже присутствующий во входе сигнал или синтезирует независимо от
+        него.
+    """
+    from tqdm.auto import tqdm
+
+    if indices is None:
+        indices = list(range(min(n_patches, len(dataset))))
+
+    bbdm = bbdm.to(device).eval()
+    ps_target = _mean_target_rapsd(bbdm, dataset, indices, batch_size, device)
+    freqs = np.arange(len(ps_target)) / len(ps_target)
+    ps_target_np = ps_target.cpu().numpy()
+
+    # Шаги траектории зависят только от T и S, не от входа -- считаем раз.
+    steps = torch.linspace(bbdm.T, 1, S, device=device).round().long()
+    steps = torch.unique(steps).flip(0)
+    steps_list = steps.tolist()
+
+    probe_idx = {}
+    for want_t in t_probe:
+        probe_idx[want_t] = min(
+            range(len(steps_list)), key=lambda i: abs(steps_list[i] - want_t)
+        )
+
+    sums_out = {w: None for w in t_probe}
+    sums_in = {w: None for w in t_probe}
+    n = 0
+
+    batches = _iter_batches(dataset, indices, batch_size)
+    n_batches = (len(indices) + batch_size - 1) // batch_size
+    batches = tqdm(batches, total=n_batches, desc="trajectory spectrum")
+
+    for b_i, (x0, _y) in enumerate(batches):
+        x0 = x0.to(device)
+        B = x0.shape[0]
+        g = torch.Generator(device=device)
+        g.manual_seed(seed + b_i)
+
+        y_cond = x0
+        if bbdm.eta > 0:
+            x_t = x0 + math.sqrt(bbdm.eta) * bbdm._randn_like(x0, g)
+        else:
+            x_t = x0.clone()
+
+        for i, t_val in enumerate(steps):
+            t_prev_val = steps[i + 1] if i + 1 < len(steps) else steps.new_zeros(())
+            t = t_val.expand(B)
+            t_prev = t_prev_val.expand(B)
+
+            pred = bbdm.model(x_t, t)
+
+            for want_t, probe_i in probe_idx.items():
+                if probe_i == i:
+                    ps_out = bbdm.rapsd(pred)
+                    ps_in = bbdm.rapsd(x_t)
+                    sums_out[want_t] = ps_out if sums_out[want_t] is None else sums_out[want_t] + ps_out
+                    sums_in[want_t] = ps_in if sums_in[want_t] is None else sums_in[want_t] + ps_in
+
+            c_x, c_y, c_e, d_tilde = bbdm._posterior_coeffs(t, t_prev)
+            c_x = c_x.view(-1, 1, 1, 1)
+            c_y = c_y.view(-1, 1, 1, 1)
+            c_e = c_e.view(-1, 1, 1, 1)
+            d_tilde = d_tilde.view(-1, 1, 1, 1)
+
+            mean = (c_x - c_e) * x_t + c_e * pred + c_y * y_cond
+            if bool((d_tilde > 0).any()):
+                x_t = mean + d_tilde.clamp(min=0).sqrt() * bbdm._randn_like(x_t, g)
+            else:
+                x_t = mean
+        n += 1
+        # Финальное состояние ПОСЛЕДНЕГО батча -- только для сверки этого
+        # цикла с продакшн-кодом BBDM.sample() (см. тест на побитовое
+        # совпадение); ничего не агрегирует между батчами.
+        last_batch_final_x_t = x_t.detach().cpu()
+
+    ratio_bands, input_ratio_bands, actual_t = [], [], []
+    for want_t in t_probe:
+        ps_out = (sums_out[want_t] / max(n, 1)).cpu().numpy()
+        ps_in = (sums_in[want_t] / max(n, 1)).cpu().numpy()
+        ratio_bands.append(band_average(ps_out / (ps_target_np + 1e-20), freqs, bands))
+        input_ratio_bands.append(band_average(ps_in / (ps_target_np + 1e-20), freqs, bands))
+        actual_t.append(steps_list[probe_idx[want_t]])
+
+    return {
+        "requested_t": list(t_probe),
+        "actual_t": actual_t,
+        "bands": list(bands),
+        "ratio_bands": ratio_bands,
+        "input_ratio_bands": input_ratio_bands,
+        "last_batch_final_x_t": last_batch_final_x_t,
+    }
+
+
+def print_trajectory_spectrum(result):
+    """Таблица: мощность выхода / мощность цели на РЕАЛЬНОЙ траектории."""
+    bands = result["bands"]
+    head = f"{'t (real)':>10}" + "".join(f"{f'{lo}-{hi}':>14}" for lo, hi in bands)
+
+    print("\nМощность выхода сети / мощность цели, на РЕАЛЬНОЙ траектории")
+    print(head)
+    print("  " + "-" * (len(head) - 2))
+    for i, act_t in enumerate(result["actual_t"]):
+        row = "".join(f"{v:>14.2f}" for v in result["ratio_bands"][i])
+        print(f"{act_t:>10}{row}")
+
+    print("\nМощность ВХОДНОГО состояния x_t / мощность цели (для сравнения)")
+    print(head)
+    print("  " + "-" * (len(head) - 2))
+    for i, act_t in enumerate(result["actual_t"]):
+        row = "".join(f"{v:>14.2f}" for v in result["input_ratio_bands"][i])
+        print(f"{act_t:>10}{row}")
+
+    print("\n  Если 'выход' близок к 'входу' на каждом t -- сеть в основном")
+    print("  ПРОПУСКАЕТ то, что уже накопилось в x_t, а не порождает заново.")
+
+
+def print_trajectory_vs_qsample(traj, qsample):
+    """Одношаговое отношение мощности: q_sample (in-distribution) vs траектория.
+
+    Требует, чтобы `traj` и `qsample` были посчитаны с ОДИНАКОВЫМ по
+    порядку списком t (`diagnose_trajectory_spectrum(t_probe=...)` и
+    `diagnose_prediction_spectrum(t_values=...)` с тем же кортежем) --
+    строки сопоставляются по индексу, не по значению.
+
+    Большой разрыв между колонками -- признак exposure bias: сеть ведёт
+    себя иначе на состояниях, которые реально встречает при генерации, чем
+    на состояниях из обучающего распределения при том же t.
+    """
+    if traj["requested_t"] != qsample["t_values"]:
+        raise ValueError(
+            "traj['requested_t'] и qsample['t_values'] не совпадают -- "
+            "запустите обе функции с одним и тем же кортежем t, иначе "
+            "строки нельзя сопоставить по индексу"
+        )
+    if traj["bands"] != qsample["bands"]:
+        raise ValueError("bands должны совпадать в обеих диагностиках")
+
+    bands = traj["bands"]
+    print("\nМощность выхода / мощность цели: q_sample vs РЕАЛЬНАЯ траектория\n")
+    for bi, (lo, hi) in enumerate(bands):
+        print(f"band {lo}-{hi}:")
+        print(f"  {'t':>10}{'q_sample':>12}{'trajectory':>14}{'(факт. t)':>12}")
+        for i, want_t in enumerate(traj["requested_t"]):
+            q = qsample["ratio_bands"][i][bi]
+            tr = traj["ratio_bands"][i][bi]
+            print(f"  {want_t:>10}{q:>12.2f}{tr:>14.2f}{traj['actual_t'][i]:>12}")
+        print()
+
+
+@torch.no_grad()
+def compute_2d_power_spectrum(
+    bbdm, dataset, n_patches=16, batch_size=4, device="cuda",
+    indices=None, S=200, seed=0,
+):
+    """Средний ПОЛНЫЙ (не радиально усреднённый) 2D-спектр предсказания и цели.
+
+    Радиальное усреднение в `evaluate_spectra` -- ровно то, что прячет
+    НАПРАВЛЕННЫЙ артефакт вроде шахматки от `ConvTranspose2d(stride=2)` в
+    `UpBlock`: два артефакта одного радиуса, но разного угла, усредняются
+    в одно число. Здесь сохраняется полная карта (H, W), так что
+    анизотропный избыток -- мощность, сконцентрированная вдоль осей
+    изображения или в углах Найквиста, а не равномерно по кольцу, -- виден
+    напрямую.
+
+    Returns:
+        dict с pred, target (обе (H, W), в нормализованных единицах,
+        усреднены по патчам и батчам с весом по размеру батча) и ratio.
+    """
+    if indices is None:
+        indices = list(range(min(n_patches, len(dataset))))
+
+    bbdm = bbdm.to(device).eval()
+
+    total_pred = total_target = None
+    total_n = 0
+
+    for b_i, (x0, y) in enumerate(_iter_batches(dataset, indices, batch_size)):
+        x0, y = x0.to(device), y.to(device)
+        g = torch.Generator(device=device)
+        g.manual_seed(seed + b_i)
+
+        pred = bbdm.sample(x0, S=S, generator=g)
+
+        h, w = pred.shape[-2:]
+        win = bbdm._hann_window(h, w, pred.device, pred.dtype)
+
+        f_pred = torch.fft.fftshift(torch.fft.fft2(pred * win, norm="ortho"), dim=(-2, -1))
+        f_true = torch.fft.fftshift(torch.fft.fft2(y * win, norm="ortho"), dim=(-2, -1))
+
+        # Сумма (не среднее) по батчу и каналу -- усредняем по общему числу
+        # патчей в конце, взвешенно, чтобы неполный последний батч не сместил
+        # результат.
+        p_pred_sum = (f_pred.real ** 2 + f_pred.imag ** 2).sum(dim=(0, 1))
+        p_true_sum = (f_true.real ** 2 + f_true.imag ** 2).sum(dim=(0, 1))
+
+        total_pred = p_pred_sum if total_pred is None else total_pred + p_pred_sum
+        total_target = p_true_sum if total_target is None else total_target + p_true_sum
+        total_n += x0.shape[0]
+
+    mean_pred = (total_pred / max(total_n, 1)).cpu().numpy()
+    mean_target = (total_target / max(total_n, 1)).cpu().numpy()
+
+    return {
+        "pred": mean_pred,
+        "target": mean_target,
+        "ratio": mean_pred / (mean_target + 1e-20),
+        "n_patches": total_n,
+    }
+
+
+def plot_2d_power_spectrum(result, title=None):
+    """Изображения (лог-шкала) 2D-спектра цели, предсказания и их отношения.
+
+    Смотреть на мощность, НЕ равномерную по углу на фиксированном
+    радиусе, -- яркую вдоль осей или сконцентрированную в четырёх углах
+    Найквиста. Радиально усреднённый RAPSD такую картину усредняет и
+    прячет. Это подпись артефакта апсемплинга со страйдом (шахматка), а
+    не реальной структуры неба -- у неё нет выделенного направления.
+    """
+    import matplotlib.colors as mcolors
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    positive = result["target"][result["target"] > 0]
+    vmin = float(np.percentile(positive, 1)) if positive.size else 1e-10
+    vmax = float(np.percentile(result["target"], 99.9))
+
+    for ax, key, label in [(axes[0], "target", "target"), (axes[1], "pred", "prediction")]:
+        im = ax.imshow(result[key], norm=mcolors.LogNorm(vmin=vmin, vmax=vmax), cmap="inferno")
+        ax.set_title(f"2D power spectrum: {label}")
+        ax.axis("off")
+        fig.colorbar(im, ax=ax, shrink=0.8)
+
+    im = axes[2].imshow(result["ratio"], norm=mcolors.LogNorm(vmin=0.1, vmax=10), cmap="RdBu_r")
+    axes[2].set_title("ratio: pred / target")
+    axes[2].axis("off")
+    fig.colorbar(im, ax=axes[2], shrink=0.8)
+
+    if title:
+        fig.suptitle(title)
+    else:
+        fig.suptitle(f"n={result['n_patches']} patches")
+    plt.tight_layout()
+    plt.show()
+    return fig
+
+
+def axis_vs_diagonal_power(power_2d, bands, axis_half_width_deg=10.0):
+    """Средняя мощность вдоль осей vs вдоль диагоналей, по частотным полосам.
+
+    Отношение, далёкое от 1 на высоком радиусе, присутствующее у
+    предсказания, но не у цели, -- количественная подпись направленного
+    (шахматка / страйдовый апсемплинг) артефакта, а не изотропной мощности
+    неба или шума.
+    """
+    h, w = power_2d.shape
+    cy, cx = h // 2, w // 2
+    yy, xx = np.indices((h, w))
+    r = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+    theta = np.degrees(np.arctan2(yy - cy, xx - cx)) % 180  # свернуть в [0, 180)
+
+    def _near(angle, width):
+        d = np.minimum(np.abs(theta - angle), 180 - np.abs(theta - angle))
+        return d <= width
+
+    axis_mask = _near(0, axis_half_width_deg) | _near(90, axis_half_width_deg)
+    diag_mask = _near(45, axis_half_width_deg) | _near(135, axis_half_width_deg)
+
+    r_max = min(cx, cy)
+    out = []
+    for lo, hi in bands:
+        ring = (r >= lo * r_max) & (r < hi * r_max)
+        a_sel, d_sel = ring & axis_mask, ring & diag_mask
+        axis_power = float(power_2d[a_sel].mean()) if a_sel.any() else float("nan")
+        diag_power = float(power_2d[d_sel].mean()) if d_sel.any() else float("nan")
+        out.append(axis_power / diag_power if diag_power and diag_power > 0 else float("nan"))
+    return out
+
+
+def print_anisotropy_table(result, bands=DEFAULT_BANDS):
+    """Таблица: отношение мощности вдоль осей к мощности по диагоналям."""
+    axis_t = axis_vs_diagonal_power(result["target"], bands)
+    axis_p = axis_vs_diagonal_power(result["pred"], bands)
+
+    print(f"\n{'band':>14}{'axis/diag target':>19}{'axis/diag pred':>17}")
+    print("  " + "-" * 48)
+    for i, (lo, hi) in enumerate(bands):
+        print(f"{lo:.3f}-{hi:<6.2f}{axis_t[i]:>19.3f}{axis_p[i]:>17.3f}")
+
+    print("\n  ~1.0 -- изотропно (нет выделенного направления), как и должно")
+    print("  быть у реальной структуры неба. Значение, далёкое от 1 у")
+    print("  'pred', но не у 'target', и усиливающееся к высоким частотам,")
+    print("  указывает на направленный артефакт сети (например, страйдовый")
+    print("  апсемплинг / шахматку), а не на физическую анизотропию.")

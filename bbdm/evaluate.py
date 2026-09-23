@@ -20,7 +20,6 @@ import torch
 from bbdm.metrics.power_spectrum import (
     DEFAULT_BANDS,
     band_average,
-    compute_power_spectrum,
     cross_spectrum_terms,
 )
 from bbdm.sample import sample_batch
@@ -85,7 +84,7 @@ def evaluate_spectra(
 
     bbdm = bbdm.to(device).eval()
 
-    sum_pred = sum_target = sum_input = sum_cross = None
+    sum_pred = sum_target = sum_input = sum_cross = sum_cross_in = None
     freqs = None
     per_patch_tf_bands = []
     per_patch_r_bands = []
@@ -106,21 +105,23 @@ def evaluate_spectra(
             source = x0[:, 0].numpy() * sigma + mu
 
             for k in range(pred.shape[0]):
-                ps_in, freqs = compute_power_spectrum(source[k])
-                cross_ell, ps_pred, ps_target, _ = cross_spectrum_terms(
+                cross_ell, ps_pred, ps_target, freqs = cross_spectrum_terms(
                     pred[k], target[k]
                 )
+                cross_in, _, ps_in, _ = cross_spectrum_terms(pred[k], source[k])
 
                 if sum_pred is None:
                     sum_pred = np.zeros_like(ps_pred)
                     sum_target = np.zeros_like(ps_target)
                     sum_input = np.zeros_like(ps_in)
                     sum_cross = np.zeros_like(cross_ell)
+                    sum_cross_in = np.zeros_like(cross_in)
 
                 sum_pred += ps_pred
                 sum_target += ps_target
                 sum_input += ps_in
                 sum_cross += cross_ell
+                sum_cross_in += cross_in
 
                 tf_k = ps_pred / (ps_target + 1e-20)
                 r_k = cross_ell / (np.sqrt(ps_pred * ps_target) + 1e-20)
@@ -135,9 +136,14 @@ def evaluate_spectra(
     mean_target = sum_target / n
     mean_input = sum_input / n
     mean_cross = sum_cross / n
+    mean_cross_in = sum_cross_in / n
 
     tf = mean_pred / (mean_target + 1e-20)
     r_ell = mean_cross / (np.sqrt(mean_pred * mean_target) + 1e-20)
+    # Корреляция предсказания со ВХОДОМ. Там, где Planck -- в основном его
+    # собственный шум (0.1–0.3), высокое r_input при r_ell ~ 0 значит, что
+    # модель не генерирует мощность, а переносит на выход шум Planck.
+    r_input = mean_cross_in / (np.sqrt(mean_pred * mean_input) + 1e-20)
 
     tf_bands = np.asarray(per_patch_tf_bands)
     r_bands = np.asarray(per_patch_r_bands)
@@ -146,6 +152,8 @@ def evaluate_spectra(
         "freqs": freqs,
         "tf": tf,
         "r_ell": r_ell,
+        "r_input": r_input,
+        "r_input_bands": band_average(r_input, freqs, bands),
         "ps_pred": mean_pred,
         "ps_target": mean_target,
         "ps_input": mean_input,
@@ -165,11 +173,13 @@ def evaluate_spectra(
 
 
 def print_band_table(results, label=""):
-    """Таблица TF и r_ell по частотным полосам."""
-    header = f"  {'band':<14}{'TF':>10}{'TF ±':>9}{'r_ell':>10}{'r_ell ±':>9}"
+    """Таблица TF, r_ell (с целью) и r_in (со входом Planck) по полосам."""
+    header = (f"  {'band':<14}{'TF':>10}{'TF ±':>9}{'r_ell':>10}{'r_ell ±':>9}"
+              f"{'r_in':>9}")
     print(f"\n{label} (n={results['n_patches']} patches, eta={results['eta']})")
     print(header)
     print("  " + "-" * (len(header) - 2))
+    r_in = results.get("r_input_bands", [float("nan")] * len(results["bands"]))
     for i, (lo, hi) in enumerate(results["bands"]):
         print(
             f"  {lo:.3f}-{hi:.2f}   "
@@ -177,6 +187,7 @@ def print_band_table(results, label=""):
             f"{results['tf_bands_per_patch_std'][i]:>9.3f}"
             f"{results['r_bands'][i]:>10.3f}"
             f"{results['r_bands_per_patch_std'][i]:>9.3f}"
+            f"{r_in[i]:>9.3f}"
         )
 
 
@@ -464,7 +475,7 @@ def diagnose_prediction_spectrum(
             t = torch.full((x0.shape[0],), int(t_val), device=x0.device,
                            dtype=torch.long)
             x_t, _ = bbdm.q_sample(x0, y, t, generator=g)
-            ps = bbdm.rapsd(bbdm.model(x_t, t))
+            ps = bbdm.rapsd(bbdm.denoise(x_t, t, x0))
             total = ps if total is None else total + ps
             n += 1
 
@@ -587,7 +598,7 @@ def diagnose_trajectory_spectrum(
             t = t_val.expand(B)
             t_prev = t_prev_val.expand(B)
 
-            pred = bbdm.model(x_t, t)
+            pred = bbdm.denoise(x_t, t, y_cond)
 
             for want_t, probe_i in probe_idx.items():
                 if probe_i == i:
@@ -702,16 +713,22 @@ def compute_2d_power_spectrum(
     изображения или в углах Найквиста, а не равномерно по кольцу, -- виден
     напрямую.
 
+    Возвращает и спектр ВХОДА (Planck): run 4 показал, что сеть переносит
+    содержимое Planck на выход почти без ослабления, так что анизотропия
+    выхода может оказаться анизотропией входа (например, следом репроекции
+    HEALPix -> CAR), а не артефактом сети. Сравнение трёх колонок это
+    различает.
+
     Returns:
-        dict с pred, target (обе (H, W), в нормализованных единицах,
-        усреднены по патчам и батчам с весом по размеру батча) и ratio.
+        dict с pred, target, input (все (H, W), в нормализованных единицах,
+        усреднены по патчам с весом по размеру батча) и ratio = pred/target.
     """
     if indices is None:
         indices = list(range(min(n_patches, len(dataset))))
 
     bbdm = bbdm.to(device).eval()
 
-    total_pred = total_target = None
+    total_pred = total_target = total_input = None
     total_n = 0
 
     for b_i, (x0, y) in enumerate(_iter_batches(dataset, indices, batch_size)):
@@ -724,25 +741,28 @@ def compute_2d_power_spectrum(
         h, w = pred.shape[-2:]
         win = bbdm._hann_window(h, w, pred.device, pred.dtype)
 
-        f_pred = torch.fft.fftshift(torch.fft.fft2(pred * win, norm="ortho"), dim=(-2, -1))
-        f_true = torch.fft.fftshift(torch.fft.fft2(y * win, norm="ortho"), dim=(-2, -1))
+        def _power_sum(img):
+            # Сумма (не среднее) по батчу и каналу -- усредняем по общему числу
+            # патчей в конце, взвешенно, чтобы неполный последний батч не
+            # сместил результат.
+            f = torch.fft.fftshift(torch.fft.fft2(img * win, norm="ortho"), dim=(-2, -1))
+            return (f.real ** 2 + f.imag ** 2).sum(dim=(0, 1))
 
-        # Сумма (не среднее) по батчу и каналу -- усредняем по общему числу
-        # патчей в конце, взвешенно, чтобы неполный последний батч не сместил
-        # результат.
-        p_pred_sum = (f_pred.real ** 2 + f_pred.imag ** 2).sum(dim=(0, 1))
-        p_true_sum = (f_true.real ** 2 + f_true.imag ** 2).sum(dim=(0, 1))
-
-        total_pred = p_pred_sum if total_pred is None else total_pred + p_pred_sum
-        total_target = p_true_sum if total_target is None else total_target + p_true_sum
+        p_pred, p_true, p_in = _power_sum(pred), _power_sum(y), _power_sum(x0)
+        total_pred = p_pred if total_pred is None else total_pred + p_pred
+        total_target = p_true if total_target is None else total_target + p_true
+        total_input = p_in if total_input is None else total_input + p_in
         total_n += x0.shape[0]
 
-    mean_pred = (total_pred / max(total_n, 1)).cpu().numpy()
-    mean_target = (total_target / max(total_n, 1)).cpu().numpy()
+    n = max(total_n, 1)
+    mean_pred = (total_pred / n).cpu().numpy()
+    mean_target = (total_target / n).cpu().numpy()
+    mean_input = (total_input / n).cpu().numpy()
 
     return {
         "pred": mean_pred,
         "target": mean_target,
+        "input": mean_input,
         "ratio": mean_pred / (mean_target + 1e-20),
         "n_patches": total_n,
     }
@@ -759,21 +779,24 @@ def plot_2d_power_spectrum(result, title=None):
     """
     import matplotlib.colors as mcolors
 
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    panels = [("input", "Planck (input)"), ("target", "target"), ("pred", "prediction")]
+    panels = [(k, lbl) for k, lbl in panels if k in result]
+
+    fig, axes = plt.subplots(1, len(panels) + 1, figsize=(5.3 * (len(panels) + 1), 5))
     positive = result["target"][result["target"] > 0]
     vmin = float(np.percentile(positive, 1)) if positive.size else 1e-10
     vmax = float(np.percentile(result["target"], 99.9))
 
-    for ax, key, label in [(axes[0], "target", "target"), (axes[1], "pred", "prediction")]:
+    for ax, (key, label) in zip(axes, panels):
         im = ax.imshow(result[key], norm=mcolors.LogNorm(vmin=vmin, vmax=vmax), cmap="inferno")
         ax.set_title(f"2D power spectrum: {label}")
         ax.axis("off")
         fig.colorbar(im, ax=ax, shrink=0.8)
 
-    im = axes[2].imshow(result["ratio"], norm=mcolors.LogNorm(vmin=0.1, vmax=10), cmap="RdBu_r")
-    axes[2].set_title("ratio: pred / target")
-    axes[2].axis("off")
-    fig.colorbar(im, ax=axes[2], shrink=0.8)
+    im = axes[-1].imshow(result["ratio"], norm=mcolors.LogNorm(vmin=0.1, vmax=10), cmap="RdBu_r")
+    axes[-1].set_title("ratio: pred / target")
+    axes[-1].axis("off")
+    fig.colorbar(im, ax=axes[-1], shrink=0.8)
 
     if title:
         fig.suptitle(title)
@@ -820,14 +843,21 @@ def print_anisotropy_table(result, bands=DEFAULT_BANDS):
     """Таблица: отношение мощности вдоль осей к мощности по диагоналям."""
     axis_t = axis_vs_diagonal_power(result["target"], bands)
     axis_p = axis_vs_diagonal_power(result["pred"], bands)
+    if "input" in result:
+        axis_i = axis_vs_diagonal_power(result["input"], bands)
+    else:
+        axis_i = [float("nan")] * len(bands)
 
-    print(f"\n{'band':>14}{'axis/diag target':>19}{'axis/diag pred':>17}")
-    print("  " + "-" * 48)
+    print(f"\n{'band':>14}{'input':>10}{'target':>10}{'pred':>10}   (axis/diag power)")
+    print("  " + "-" * 42)
     for i, (lo, hi) in enumerate(bands):
-        print(f"{lo:.3f}-{hi:<6.2f}{axis_t[i]:>19.3f}{axis_p[i]:>17.3f}")
+        print(f"{lo:.3f}-{hi:<6.2f}{axis_i[i]:>10.3f}{axis_t[i]:>10.3f}{axis_p[i]:>10.3f}")
 
-    print("\n  ~1.0 -- изотропно (нет выделенного направления), как и должно")
-    print("  быть у реальной структуры неба. Значение, далёкое от 1 у")
-    print("  'pred', но не у 'target', и усиливающееся к высоким частотам,")
-    print("  указывает на направленный артефакт сети (например, страйдовый")
-    print("  апсемплинг / шахматку), а не на физическую анизотропию.")
+    print("\n  ~1.0 -- изотропно (нет выделенного направления). Далеко от 1 у")
+    print("  'pred', но не у 'input' и 'target' -- артефакт СЕТИ (апсемплинг).")
+    print("  Далеко от 1 и у 'input' тоже -- вход сам анизотропен (например,")
+    print("  след репроекции Planck), и сеть его переносит.")
+    print("  Замечание: патчи в проекции CAR, пиксель по x на небе в cos(dec)")
+    print("  раз уже, чем по y, так что x и y физически не равноправны; на")
+    print("  самых низких частотах, где в полосе мало мод, отличие от 1 есть")
+    print("  и у цели -- это свойство данных, а не модели.")

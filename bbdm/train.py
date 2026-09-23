@@ -1,4 +1,5 @@
-"""Цикл обучения BBDM с EMA, детерминированной валидацией и резюмом."""
+"""Цикл обучения BBDM с EMA, детерминированной валидацией, резюмом и
+спектральным монитором настоящего сэмплера."""
 
 import os
 from copy import deepcopy
@@ -12,13 +13,20 @@ from bbdm.config import (
     CHECKPOINT_DIR,
     EMA_DECAY,
     EMA_START,
+    ETA,
     GRAD_CLIP,
+    GROUPS,
+    MONITOR_EVERY,
+    MONITOR_N,
+    MONITOR_S,
     NUM_WORKERS,
     SCHEDULER_FACTOR,
     SCHEDULER_PATIENCE,
     SPECTRAL_WEIGHT,
     VAL_SEED,
 )
+from bbdm.evaluate import evaluate_spectra
+from bbdm.model import BBDM, UNet
 
 
 class EMA:
@@ -83,6 +91,70 @@ def _validate(bbdm, val_loader, device, spectral_weight, val_seed):
     return total / n, total_mse / n, total_spec / n
 
 
+def _run_monitor(bbdm, ema, dataset, device, n_patches, S, epoch):
+    """TF / r_ell / r_in НАСТОЯЩЕГО сэмплера на нескольких val-патчах.
+
+    Смысл -- поймать провал, невидимый одношаговому лоссу. В run 4
+    val-лосс вёл себя нормально все 100 эпох, а TF на выходе сэмплера была
+    9.5: избыток рождается только в цепочке обратного процесса. Считается
+    на EMA-весах (до ema_start там лежат живые), то есть на том, что потом
+    уйдёт в инференс. Патчи и сид фиксированы, поэтому числа сравнимы
+    между эпохами.
+    """
+    monitor_bbdm = BBDM(ema.shadow, T=bbdm.T, s=bbdm.s, eta=bbdm.eta).to(device)
+    n = min(n_patches, len(dataset))
+    res = evaluate_spectra(
+        monitor_bbdm, dataset,
+        mu=getattr(dataset, "mu", 0.0), sigma=getattr(dataset, "sigma", 1.0),
+        indices=list(range(n)), S=S, device=device,
+        batch_size=min(4, n), seed=0, progress=False,
+    )
+
+    parts = []
+    flagged = False
+    for (lo, hi), tf, r, r_in in zip(res["bands"], res["tf_bands"], res["r_bands"],
+                                      res["r_input_bands"]):
+        parts.append(f"{lo:g}-{hi:g}: TF {tf:.2f} r {r:.2f} r_in {r_in:.2f}")
+        # Флаг только на ИЗБЫТОК: это режим run 4, невидимый одношаговому
+        # лоссу. Недобор (TF < 1) в первых эпохах нормален -- недообученный
+        # MSE-денойзер гладкий -- и виден в самой строке; предупреждение на
+        # него кричало бы каждую раннюю эпоху, и его перестали бы читать.
+        if tf == tf and tf > 2.0:  # tf == tf отсекает nan
+            flagged = True
+    line = f"  [monitor ep {epoch + 1}, S={S}, n={n}] " + " | ".join(parts)
+    if flagged:
+        line += ("\n  [monitor] TF > 2 -- избыток мощности на выходе сэмплера, "
+                 "как в run 4. Посмотрите до того, как тратить на прогон ещё часы.")
+    tqdm.write(line)
+
+    return {
+        "epoch": epoch,
+        "S": S,
+        "n_patches": n,
+        "bands": res["bands"],
+        "tf_bands": res["tf_bands"],
+        "r_bands": res["r_bands"],
+        "r_input_bands": res["r_input_bands"],
+    }
+
+
+def _hparams(bbdm, spectral_weight):
+    """Гиперпараметры процесса и архитектуры -- пишутся рядом с весами."""
+    net = bbdm.model
+    return {
+        "T": bbdm.T,
+        "s": bbdm.s,
+        "eta": bbdm.eta,
+        "spectral_weight": spectral_weight,
+        "in_ch": getattr(net, "in_ch", None),
+        "cond_ch": getattr(net, "cond_ch", 0),
+        "base_ch": getattr(net, "base_ch", None),
+        "time_dim": getattr(net, "time_dim", None),
+        "groups": getattr(net, "groups", None),
+        "upsample": getattr(net, "upsample", None),
+    }
+
+
 def train(
     bbdm,
     train_dataset,
@@ -97,14 +169,36 @@ def train(
     num_workers=NUM_WORKERS,
     val_seed=VAL_SEED,
     resume=False,
+    overwrite=False,
+    monitor_dataset=None,
+    monitor_every=MONITOR_EVERY,
+    monitor_n=MONITOR_N,
+    monitor_S=MONITOR_S,
 ):
     """Обучает BBDM и возвращает (bbdm, ema).
 
     Args:
         spectral_weight: вес L1(log RAPSD) в лоссе. 0 -- чистый MSE.
         resume: продолжить с `last.pt` в checkpoint_dir, если он есть.
+        overwrite: разрешить НОВЫЙ прогон в папке, где уже есть best.pt /
+            last.pt. По умолчанию запрещено -- это единственная копия
+            прошлого многочасового прогона.
+        monitor_dataset: если задан, каждые `monitor_every` эпох на первых
+            `monitor_n` его патчах прогоняется настоящий сэмплер
+            (`monitor_S` шагов) и печатаются TF / r_ell / r_in по полосам.
     """
     os.makedirs(checkpoint_dir, exist_ok=True)
+    last_path = os.path.join(checkpoint_dir, "last.pt")
+    best_path = os.path.join(checkpoint_dir, "best.pt")
+
+    if not resume and not overwrite and (
+        os.path.exists(best_path) or os.path.exists(last_path)
+    ):
+        raise FileExistsError(
+            f"В {checkpoint_dir} уже есть best.pt/last.pt. Новый прогон их "
+            "перезапишет. Укажите новую checkpoint_dir, resume=True чтобы "
+            "продолжить, или overwrite=True, если прошлый прогон не нужен."
+        )
 
     loader_kwargs = dict(num_workers=num_workers, pin_memory=(device != "cpu"))
     if num_workers > 0:
@@ -114,9 +208,8 @@ def train(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        # Спектральный член лосса усредняет спектр по батчу; хвостовой
-        # батч из 1-2 патчей дал бы заметно более шумную оценку с тем же
-        # весом, что и полный.
+        # Хвостовой батч из 1-2 патчей дал бы заметно более шумную оценку
+        # спектрального члена (если он включён) с тем же весом, что и полный.
         drop_last=True,
         **loader_kwargs,
     )
@@ -138,8 +231,8 @@ def train(
     global_step = 0
     start_epoch = 0
     best_val_loss = float("inf")
+    monitor_history = []
 
-    last_path = os.path.join(checkpoint_dir, "last.pt")
     if resume and os.path.exists(last_path):
         ckpt = torch.load(last_path, map_location=device, weights_only=False)
         bbdm.load_state_dict(ckpt["model"])
@@ -149,6 +242,7 @@ def train(
         global_step = ckpt["global_step"]
         start_epoch = ckpt["epoch"] + 1
         best_val_loss = ckpt["best_val_loss"]
+        monitor_history = ckpt.get("monitor", [])
         print(f"Resumed from epoch {start_epoch} (step {global_step})")
 
     epoch_bar = tqdm(range(start_epoch, n_epochs), desc="Epochs")
@@ -211,6 +305,11 @@ def train(
         if global_step < ema_start:
             ema.copy_from(bbdm.model)
 
+        if monitor_dataset is not None and monitor_every and (epoch + 1) % monitor_every == 0:
+            monitor_history.append(
+                _run_monitor(bbdm, ema, monitor_dataset, device, monitor_n, monitor_S, epoch)
+            )
+
         state = {
             "epoch": epoch,
             "global_step": global_step,
@@ -223,23 +322,62 @@ def train(
             "val_spec": val_spec,
             "train_loss": train_loss,
             "best_val_loss": min(best_val_loss, val_loss),
-            # Пишем гиперпараметры процесса рядом с весами: иначе при
-            # инференсе легко молча взять другое T/s/eta.
-            "hparams": {
-                "T": bbdm.T,
-                "s": bbdm.s,
-                "eta": bbdm.eta,
-                "spectral_weight": spectral_weight,
-            },
+            # Гиперпараметры процесса и архитектуры рядом с весами: иначе при
+            # инференсе легко молча взять другое T/s/eta или другую сеть.
+            "hparams": _hparams(bbdm, spectral_weight),
+            "monitor": monitor_history,
         }
         torch.save(state, last_path)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(state, os.path.join(checkpoint_dir, "best.pt"))
+            torch.save(state, best_path)
             tqdm.write(
                 f"Epoch {epoch+1} saved best "
                 f"(val={val_loss:.6f}, mse={val_mse:.6f}, spec={val_spec:.4f})"
             )
 
     return bbdm, ema
+
+
+def load_checkpoint(path, device="cuda", use_ema=True):
+    """Строит BBDM под архитектуру чекпоинта и загружает в неё веса.
+
+    Архитектура (апсемплинг, канал условия, ширина) определяется по ключам
+    и формам state_dict, а T и s -- по буферам m_t / delta_t, а не по
+    hparams: у чекпоинтов run 3/4 этих полей ещё не было. Поэтому один и тот
+    же вызов корректно открывает и старые чекпоинты (ConvTranspose2d, без
+    условия), и новые.
+
+    Args:
+        use_ema: заменить веса сети EMA-тенью (так делается инференс).
+
+    Returns:
+        (bbdm в режиме eval на device, словарь чекпоинта).
+    """
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    state = ckpt["model"]
+    hp = ckpt.get("hparams", {})
+
+    upsample = "transpose" if "model.up1.up.weight" in state else "resize_conv"
+    init_w = state["model.init_conv.weight"]
+    in_ch = int(state["model.out_conv.weight"].shape[0])
+    cond_ch = int(init_w.shape[1]) - in_ch
+    base_ch = int(init_w.shape[0])
+    time_dim = int(state["model.time_emb.net.0.weight"].shape[1])
+    # Число групп GroupNorm по формам весов не восстановить.
+    groups = hp.get("groups") or GROUPS
+
+    T_ckpt = int(state["m_t"].numel())
+    # delta_t при m = 1/2 равна s / 2.
+    s_ckpt = round(2.0 * float(state["delta_t"][T_ckpt // 2 - 1]), 6)
+
+    unet = UNet(in_ch=in_ch, base_ch=base_ch, time_dim=time_dim, groups=groups,
+                cond_ch=cond_ch, upsample=upsample)
+    bbdm = BBDM(unet, T=T_ckpt, s=s_ckpt, eta=hp.get("eta", ETA),
+                spectral_weight=hp.get("spectral_weight", 0.0))
+    bbdm.load_state_dict(state)
+    if use_ema and "ema" in ckpt:
+        bbdm.model.load_state_dict(ckpt["ema"])
+
+    return bbdm.to(device).eval(), ckpt

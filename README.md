@@ -122,6 +122,7 @@ bbdm-cmb/
 │   ├── config.py                  # paths and hyperparameters
 │   ├── train.py                   # training loop, EMA, deterministic validation, DDP
 │   ├── dist.py                    # torch.distributed helpers (no-ops without torchrun)
+│   ├── early_stop.py              # stop / checkpoint selection by sampler metrics (PSNR, TF, r_ell)
 │   ├── sample.py                  # inference and visualisation
 │   ├── evaluate.py                # TF / r_ell / PSNR / SSIM averaged over patches
 │   ├── model/
@@ -141,6 +142,7 @@ bbdm-cmb/
 │   ├── test_dataset.py            # patch filters, normalisation, augmentation
 │   ├── test_phase1.py             # cond channel, upsampling, monitor, checkpoint loading
 │   ├── test_splits_freq.py        # split inheritance and tile-grid checks
+│   ├── test_early_stop.py         # early-stopping logic and its place in train()
 │   └── test_ddp.py                # 2-process DDP on CPU (gloo)
 │
 └── notebooks/
@@ -212,6 +214,33 @@ Things worth knowing:
 - **Reading the bands.** Planck's beam narrows from 100 to 217 GHz, so the multipole where
   `r_ell` falls moves outwards; `results.json` lists the band edges in ell
   (`bands_ell`, `planck_beam_ell_1e`).
+
+## Early stopping by metrics
+
+Training ends when the epoch limit is reached **or** the metrics of the real sampler say stop
+(`bbdm/early_stop.py`, settings in `config.EARLY_STOP`, flags `--patience`, `--psnr-min-delta`,
+`--r-min-delta`, `--tf-max`, `--no-early-stop`). The val loss is not used for this: it is the MSE
+of one diffusion step, and in run 4 it looked fine for 100 epochs while TF at the sampler output
+was 9.5. Every `MONITOR_EVERY` epochs (default 2) the monitor samples 32 validation patches with the
+EMA weights and computes PSNR, TF, r_ell and r_in; the stopper looks at those.
+
+- **Plateau.** A check counts as an improvement if PSNR grew by more than 0.05 dB **or** r_ell grew
+  by more than 0.01 in the 0.03-0.10 or 0.10-0.30 band. 8 checks in a row without one -> stop
+  (16 epochs at the default cadence, comfortably more than the 5-epoch LR scheduler patience).
+  r_ell is included because PSNR is dominated by large scales that are learned early, while the
+  cluster-relevant ell grows later; a PSNR-only rule would stop while it is still improving.
+- **TF guard.** TF above 2 in 2 checks in a row -> stop (excess power at the sampler output).
+- **Warm-up.** Nothing stops during the first 3 checks.
+- **Best checkpoint by metric.** `best_metric.pt` is the check with the highest PSNR among those where
+  TF is acceptable: within 1 +/- 0.15 in the bands up to f = 0.10 (where the input carries information)
+  and not above 2 everywhere. TF is not required to be 1 above the Planck beam, where an honest sample
+  has TF ~ 1 with r_ell ~ 0 and a deficit is fine. `best.pt` (lowest val loss) is still written.
+  The final evaluation uses `best_metric.pt` (`--eval-ckpt loss` for `best.pt`); if TF was never in
+  range together with a PSNR, `best_metric.pt` does not exist and the script falls back to `best.pt`
+  and says so.
+- The reason for stopping, the stopper state and all monitor checks are stored in the checkpoint and
+  in `results.json`. `--resume` of an already stopped run returns immediately. Under DDP rank 0 decides
+  and broadcasts the decision to the other ranks.
 
 ## Model
 

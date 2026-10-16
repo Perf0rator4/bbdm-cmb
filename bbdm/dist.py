@@ -73,6 +73,20 @@ def all_reduce_sum(tensor):
     return tensor
 
 
+def broadcast_bool(value, device, src=0):
+    """Значение `value` с ранга `src` -- всем рангам (на одном процессе -- как есть).
+
+    Решение об останове принимает rank 0, потому что только он считает монитор;
+    остальные обязаны узнать его тем же collective-вызовом, иначе они уйдут в
+    следующую эпоху и повиснут в backward без партнёров.
+    """
+    if not is_distributed():
+        return bool(value)
+    t = torch.tensor([1 if value else 0], dtype=torch.int32, device=device)
+    dist.broadcast(t, src=src)
+    return bool(t.item())
+
+
 def cleanup():
     if is_distributed():
         dist.destroy_process_group()

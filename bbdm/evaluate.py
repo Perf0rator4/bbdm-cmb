@@ -48,6 +48,30 @@ def _iter_batches(dataset, indices, batch_size):
         yield x0, y
 
 
+def _patch_psnr(target, pred, min_valid=1000):
+    """PSNR одного патча по валидным (незамаскированным) пикселям.
+
+    Единая реализация для `evaluate_image_metrics` и `evaluate_spectra`, чтобы
+    PSNR монитора обучения и итоговый PSNR считались одинаково.
+
+    Returns:
+        None, если патч негоден (мало валидных пикселей или нулевой размах);
+        иначе dict(psnr, valid, data_range).
+    """
+    valid = np.abs(target) > 0.5
+    if valid.sum() < min_valid:
+        return None
+    data_range = float(target[valid].max() - target[valid].min())
+    if data_range < 1e-6:
+        return None
+    mse = float(np.mean((target[valid] - pred[valid]) ** 2))
+    return {
+        "psnr": float(10 * np.log10(data_range ** 2 / (mse + 1e-12))),
+        "valid": valid,
+        "data_range": data_range,
+    }
+
+
 @torch.no_grad()
 def evaluate_spectra(
     bbdm,
@@ -63,6 +87,7 @@ def evaluate_spectra(
     indices=None,
     bands=DEFAULT_BANDS,
     progress=True,
+    with_psnr=False,
 ):
     """Transfer Function и кросс-корреляция, усреднённые по n_patches патчам.
 
@@ -72,6 +97,8 @@ def evaluate_spectra(
         indices: явный список индексов патчей; по умолчанию первые
             n_patches. Один и тот же список обязателен при сравнении
             вариантов, иначе сравниваются разные куски неба.
+        with_psnr: заодно посчитать PSNR (по тем же сэмплам, без второго
+            прохода сэмплера) -> ключи psnr_mean / psnr_std / psnr_n.
 
     Returns:
         dict с ключами freqs, tf, r_ell, ps_pred, ps_target, ps_input,
@@ -88,6 +115,7 @@ def evaluate_spectra(
     freqs = None
     per_patch_tf_bands = []
     per_patch_r_bands = []
+    psnr_list = []
 
     batches = _iter_batches(dataset, indices, batch_size)
     if progress:
@@ -127,6 +155,12 @@ def evaluate_spectra(
                 r_k = cross_ell / (np.sqrt(ps_pred * ps_target) + 1e-20)
                 per_patch_tf_bands.append(band_average(tf_k, freqs, bands))
                 per_patch_r_bands.append(band_average(r_k, freqs, bands))
+                if with_psnr:
+                    # порог валидных пикселей урезан для маленьких патчей (тесты)
+                    m = _patch_psnr(target[k], pred[k],
+                                    min_valid=min(1000, target[k].size // 2))
+                    if m is not None:
+                        psnr_list.append(m["psnr"])
 
     n = len(per_patch_tf_bands)
     if n == 0:
@@ -169,6 +203,9 @@ def evaluate_spectra(
         "r_bands_per_patch_std": r_bands.std(axis=0).tolist(),
         "n_patches": n,
         "eta": bbdm.eta if eta is None else float(eta),
+        "psnr_mean": float(np.mean(psnr_list)) if psnr_list else float("nan"),
+        "psnr_std": float(np.std(psnr_list)) if psnr_list else float("nan"),
+        "psnr_n": len(psnr_list),
     }
 
 
@@ -304,16 +341,11 @@ def evaluate_image_metrics(
 
         for k in range(pred.shape[0]):
             t_k, p_k = target[k], pred[k]
-            valid = np.abs(t_k) > 0.5
-            if valid.sum() < 1000:
+            m = _patch_psnr(t_k, p_k)
+            if m is None:
                 continue
-
-            data_range = float(t_k[valid].max() - t_k[valid].min())
-            if data_range < 1e-6:
-                continue
-
-            mse = float(np.mean((t_k[valid] - p_k[valid]) ** 2))
-            psnr_list.append(10 * np.log10(data_range ** 2 / (mse + 1e-12)))
+            valid, data_range = m["valid"], m["data_range"]
+            psnr_list.append(m["psnr"])
 
             masked_pred = np.where(valid, p_k, 0.0)
             ssim_list.append(

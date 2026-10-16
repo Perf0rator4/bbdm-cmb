@@ -126,7 +126,7 @@ def _run_monitor(bbdm, ema, dataset, device, n_patches, S, epoch):
         monitor_bbdm, dataset,
         mu=getattr(dataset, "mu", 0.0), sigma=getattr(dataset, "sigma", 1.0),
         indices=list(range(n)), S=S, device=device,
-        batch_size=min(4, n), seed=0, progress=False,
+        batch_size=min(4, n), seed=0, progress=False, with_psnr=True,
     )
 
     parts = []
@@ -140,7 +140,8 @@ def _run_monitor(bbdm, ema, dataset, device, n_patches, S, epoch):
         # него кричало бы каждую раннюю эпоху, и его перестали бы читать.
         if tf == tf and tf > 2.0:  # tf == tf отсекает nan
             flagged = True
-    line = f"  [monitor ep {epoch + 1}, S={S}, n={n}] " + " | ".join(parts)
+    line = (f"  [monitor ep {epoch + 1}, S={S}, n={n}] PSNR {res['psnr_mean']:.2f} dB | "
+            + " | ".join(parts))
     if flagged:
         line += ("\n  [monitor] TF > 2 -- избыток мощности на выходе сэмплера, "
                  "как в run 4. Посмотрите до того, как тратить на прогон ещё часы.")
@@ -154,6 +155,8 @@ def _run_monitor(bbdm, ema, dataset, device, n_patches, S, epoch):
         "tf_bands": res["tf_bands"],
         "r_bands": res["r_bands"],
         "r_input_bands": res["r_input_bands"],
+        "psnr": res["psnr_mean"],
+        "psnr_std": res["psnr_std"],
     }
 
 
@@ -217,6 +220,7 @@ def train(
     monitor_n=MONITOR_N,
     monitor_S=MONITOR_S,
     extra_state=None,
+    early_stop=None,
 ):
     """Обучает BBDM и возвращает (bbdm, ema).
 
@@ -238,10 +242,19 @@ def train(
             "extra" (mu, sigma, списки тайлов, частота...). Нормализация и
             сплит должны жить рядом с весами: иначе их приходится пересчитывать
             из train-тайлов, и на другой машине они молча разойдутся.
+        early_stop: `bbdm.early_stop.EarlyStopper` (или None -- только лимит
+            эпох). Решение принимается после каждой проверки монитора, поэтому
+            нужен `monitor_dataset`. Лучший по метрике чекпоинт пишется в
+            `best_metric.pt`, причина останова -- в `stop_reason` чекпоинта.
+            Если `last.pt` уже помечен остановленным, `resume=True` ничего
+            не дообучает и сразу возвращает загруженные веса.
     """
     main = D.is_main()
     world = D.world_size()
     distributed = world > 1
+    if early_stop is not None and (monitor_dataset is None or not monitor_every):
+        raise ValueError("early_stop требует монитор: задайте monitor_dataset и monitor_every > 0")
+    metric_path = os.path.join(checkpoint_dir, "best_metric.pt")
 
     last_path = os.path.join(checkpoint_dir, "last.pt")
     best_path = os.path.join(checkpoint_dir, "best.pt")
@@ -320,8 +333,14 @@ def train(
         start_epoch = ckpt["epoch"] + 1
         best_val_loss = ckpt["best_val_loss"]
         monitor_history = ckpt.get("monitor", [])
+        if early_stop is not None and ckpt.get("early_stop"):
+            early_stop.load_state_dict(ckpt["early_stop"])
         if main:
             print(f"Resumed from epoch {start_epoch} (step {global_step})")
+        if early_stop is not None and early_stop.stopped:
+            if main:
+                print(f"Run already stopped early: {early_stop.stop_reason}")
+            return bbdm, ema
 
     step_module = TrainStep(bbdm, spectral_weight)
     if distributed:
@@ -397,10 +416,25 @@ def train(
         if global_step < ema_start:
             ema.copy_from(bbdm.model)
 
-        if main and monitor_dataset is not None and monitor_every and (epoch + 1) % monitor_every == 0:
-            monitor_history.append(
-                _run_monitor(bbdm, ema, monitor_dataset, device, monitor_n, monitor_S, epoch)
-            )
+        # Одно и то же условие на ВСЕХ рангах: решение об останове рассылается
+        # collective-вызовом, и в нём обязаны участвовать все.
+        is_monitor_epoch = bool(
+            monitor_dataset is not None and monitor_every and (epoch + 1) % monitor_every == 0
+        )
+        stop_now, stop_reason, metric_best = False, None, False
+        if main and is_monitor_epoch:
+            entry = _run_monitor(bbdm, ema, monitor_dataset, device, monitor_n, monitor_S, epoch)
+            monitor_history.append(entry)
+            if early_stop is not None:
+                dec = early_stop.update(entry)
+                stop_now, stop_reason, metric_best = dec.stop, dec.reason, dec.is_best
+                tqdm.write(
+                    f"  [early-stop] stale {early_stop.stale}/{early_stop.patience}, "
+                    f"TF strikes {early_stop.strikes}/{early_stop.tf_strikes}, "
+                    f"improved={dec.improved}, TF ok={dec.tf_ok}, best-by-metric={dec.is_best}"
+                )
+        if early_stop is not None and is_monitor_epoch:
+            stop_now = D.broadcast_bool(stop_now, device)
 
         if main:
             state = {
@@ -421,8 +455,12 @@ def train(
                 "monitor": monitor_history,
                 "world_size": world,
                 "extra": extra_state or {},
+                "early_stop": early_stop.state_dict() if early_stop is not None else None,
+                "stop_reason": stop_reason if stop_now else None,
             }
             torch.save(state, last_path)
+            if metric_best:
+                torch.save(state, metric_path)
             if val_loss < best_val_loss:
                 tqdm.write(
                     f"Epoch {epoch+1} saved best "
@@ -436,6 +474,11 @@ def train(
         # Остальные ранги не должны убежать вперёд, пока rank 0 считает
         # монитор и пишет чекпоинт (иначе вечное ожидание в collective).
         D.barrier()
+
+        if stop_now:
+            if main:
+                tqdm.write(f"Early stop at epoch {epoch + 1}: {stop_reason}")
+            break
 
     return bbdm, ema
 

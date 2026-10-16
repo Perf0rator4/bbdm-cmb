@@ -46,6 +46,7 @@ from bbdm.data import (
     load_splits,
     save_splits,
 )
+from bbdm.early_stop import EarlyStopper
 from bbdm.model import BBDM, UNet
 
 
@@ -71,6 +72,19 @@ def parse_args(argv=None):
                         "по умолчанию восстанавливается из папки главной частоты")
     p.add_argument("--no-inherit", action="store_true",
                    help="не наследовать сплит от главной частоты (только для отладки)")
+    p.add_argument("--no-early-stop", action="store_true",
+                   help="не останавливать по метрикам (только лимит эпох)")
+    p.add_argument("--patience", type=int, default=cfg.EARLY_STOP["patience"],
+                   help="проверок монитора подряд без улучшения PSNR и r_ell -> стоп")
+    p.add_argument("--psnr-min-delta", type=float, default=cfg.EARLY_STOP["psnr_min_delta"],
+                   help="минимальный прирост PSNR (дБ), считающийся улучшением")
+    p.add_argument("--r-min-delta", type=float, default=cfg.EARLY_STOP["r_min_delta"],
+                   help="минимальный прирост r_ell, считающийся улучшением")
+    p.add_argument("--tf-max", type=float, default=cfg.EARLY_STOP["tf_max"],
+                   help="TF выше этого значения подряд -> стоп (избыток мощности, как run 4)")
+    p.add_argument("--eval-ckpt", choices=("metric", "loss"), default="metric",
+                   help="чекпоинт для финальной оценки: best_metric.pt (по PSNR при TF в норме; "
+                        "если его нет -- best.pt) или best.pt (по val-лоссу)")
     p.add_argument("--monitor-every", type=int, default=cfg.MONITOR_EVERY)
     p.add_argument("--monitor-n", type=int, default=cfg.MONITOR_N)
     p.add_argument("--monitor-S", type=int, default=cfg.MONITOR_S)
@@ -148,7 +162,18 @@ def build_norm(args, planck_dir, act_dir, train_tiles):
     return d["mu"], d["sigma"]
 
 
-def evaluate_run(args, bbdm, device, val_ds, test_ds, mu, sigma):
+def _jsonable(x):
+    """-inf/nan из состояния останова -> None, чтобы results.json был валидным JSON."""
+    if isinstance(x, dict):
+        return {k: _jsonable(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_jsonable(v) for v in x]
+    if isinstance(x, float) and (x != x or x in (float("inf"), float("-inf"))):
+        return None
+    return x
+
+
+def evaluate_run(args, bbdm, device, val_ds, test_ds, mu, sigma, extra=None):
     """Оценка лучшего чекпоинта (rank 0): TF / r_ell / r_in, PSNR/SSIM, графики."""
     from bbdm.evaluate import (
         evaluate_image_metrics,
@@ -166,6 +191,7 @@ def evaluate_run(args, bbdm, device, val_ds, test_ds, mu, sigma):
         "planck_beam_fwhm_arcmin": fwhm,
         "planck_beam_ell_1e": float(np.sqrt(2) / sigma_b),
     }
+    results.update(extra or {})
 
     for name, ds in (("val", val_ds), ("test", test_ds)):
         n = min(args.eval_patches, len(ds))
@@ -249,6 +275,21 @@ def main(argv=None):
 
         from bbdm.train import load_checkpoint, train
 
+        stopper = None
+        if not args.no_early_stop and args.monitor_every:
+            stopper = EarlyStopper(**{
+                **cfg.EARLY_STOP,
+                "patience": args.patience,
+                "psnr_min_delta": args.psnr_min_delta,
+                "r_min_delta": args.r_min_delta,
+                "tf_max": args.tf_max,
+            })
+            log(f"   early stop: patience {args.patience} checks x every {args.monitor_every} "
+                f"epoch(s), PSNR delta {args.psnr_min_delta} dB, r_ell delta {args.r_min_delta}, "
+                f"TF guard > {args.tf_max}")
+        else:
+            log("   early stop: OFF (epoch limit only)")
+
         t0 = time.time()
         train(
             bbdm, train_ds, val_ds,
@@ -263,13 +304,34 @@ def main(argv=None):
                 "splits": {"train": train_tiles, "val": val_tiles, "test": test_tiles},
                 "global_batch": args.global_batch,
             },
+            early_stop=stopper,
         )
         log(f"Training finished in {(time.time() - t0) / 3600:.2f} h")
 
         D.barrier()
         if D.is_main() and not args.skip_eval:
-            best, _ = load_checkpoint(os.path.join(args.out_dir, "best.pt"), device=device)
-            evaluate_run(args, best, device, val_ds, test_ds, mu, sigma)
+            metric_ckpt = os.path.join(args.out_dir, "best_metric.pt")
+            if args.eval_ckpt == "metric" and os.path.exists(metric_ckpt):
+                ckpt_path = metric_ckpt
+            else:
+                ckpt_path = os.path.join(args.out_dir, "best.pt")
+                if args.eval_ckpt == "metric":
+                    log("   no best_metric.pt (TF never in range together with a PSNR): "
+                        "evaluating best.pt (best val loss)")
+            best, ck = load_checkpoint(ckpt_path, device=device)
+            last = torch.load(os.path.join(args.out_dir, "last.pt"), map_location="cpu",
+                              weights_only=False)
+            log(f"   evaluating {os.path.basename(ckpt_path)} (epoch {ck['epoch'] + 1}); "
+                f"run ended at epoch {last['epoch'] + 1}"
+                + (f", early stop: {last['stop_reason']}" if last.get("stop_reason") else ""))
+            evaluate_run(args, best, device, val_ds, test_ds, mu, sigma, extra=_jsonable({
+                "eval_checkpoint": os.path.basename(ckpt_path),
+                "eval_checkpoint_epoch": ck["epoch"] + 1,
+                "last_epoch": last["epoch"] + 1,
+                "stop_reason": last.get("stop_reason"),
+                "early_stop": last.get("early_stop"),
+                "monitor": last.get("monitor"),
+            }))
         D.barrier()
     finally:
         D.cleanup()

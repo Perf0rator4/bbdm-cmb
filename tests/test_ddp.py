@@ -23,6 +23,7 @@ import torch.nn as nn
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bbdm import dist as D  # noqa: E402
+from bbdm.early_stop import EarlyStopper  # noqa: E402
 from bbdm.model.bbdm import BBDM  # noqa: E402
 from bbdm.model.unet import UNet  # noqa: E402
 from bbdm.train import _validate, load_checkpoint, train  # noqa: E402
@@ -119,6 +120,42 @@ def _worker(rank, port, tmpdir):
         json.dump(out, f)
 
 
+def _worker_stop(rank, port, tmpdir):
+    """Останов решает rank 0, и ОБА ранга обязаны выйти из цикла на одной эпохе."""
+    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port),
+                      RANK=str(rank), WORLD_SIZE=str(WORLD), LOCAL_RANK=str(rank))
+    r, w, _, device = D.init_distributed(timeout_minutes=2)   # завис бы -> ошибка, а не вечное ожидание
+    out = {"rank": r}
+    try:
+        torch.manual_seed(100 + rank)
+        unet = UNet(in_ch=1, base_ch=8, time_dim=64, groups=4, cond_ch=1)
+        bbdm = BBDM(unet, T=100, s=0.5, eta=0.0)
+        ds = _PairDataset(8, seed=1)
+        # tf_max < 0: любое положительное TF -- нарушение, останов на первой проверке
+        stopper = EarlyStopper(tf_max=-1.0, tf_strikes=1, warmup_checks=0)
+        ckdir = os.path.join(tmpdir, "ck_stop")
+        bbdm, ema = train(
+            bbdm, ds, ds, n_epochs=5, batch_size=2, lr=1e-3, ema_start=2,
+            device=device, checkpoint_dir=ckdir, num_workers=0,
+            monitor_dataset=ds, monitor_every=1, monitor_n=2, monitor_S=3,
+            early_stop=stopper,
+        )
+        out["finished"] = True
+        gathered = [None] * WORLD
+        dist.all_gather_object(gathered, _flat(bbdm.model).tolist())
+        out["max_param_diff"] = max(abs(x - y) for x, y in zip(*gathered))
+        D.barrier()
+        if rank == 0:
+            ck = torch.load(os.path.join(ckdir, "last.pt"), weights_only=False, map_location="cpu")
+            out["epoch"] = ck["epoch"]
+            out["reason"] = ck["stop_reason"]
+            out["monitor_n"] = len(ck["monitor"])
+    finally:
+        D.cleanup()
+    with open(os.path.join(tmpdir, f"stop_{rank}.json"), "w") as f:
+        json.dump(out, f)
+
+
 def _free_port():
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -156,10 +193,28 @@ def test_ddp_two_processes():
     assert r0["ema_roundtrip_diff"] < 1e-6
 
 
+def test_ddp_early_stop_is_synchronised():
+    tmpdir = tempfile.mkdtemp(prefix="ddp_stop_")
+    mp.spawn(_worker_stop, args=(_free_port(), tmpdir), nprocs=WORLD, join=True)
+    res = []
+    for r in range(WORLD):
+        with open(os.path.join(tmpdir, f"stop_{r}.json")) as f:
+            res.append(json.load(f))
+    r0, r1 = res
+    assert r0["finished"] and r1["finished"], "оба ранга должны выйти из train()"
+    assert r0["epoch"] == 0 and r0["monitor_n"] == 1, "стоп на первой же проверке"
+    assert "TF guard" in r0["reason"]
+    assert r0["max_param_diff"] < 1e-6
+
+
 if __name__ == "__main__":
-    try:
-        test_ddp_two_processes()
-        print("PASS  test_ddp_two_processes\n\n0 failure(s)")
-    except AssertionError as exc:
-        print(f"FAIL  test_ddp_two_processes: {exc}\n\n1 failure(s)")
-        sys.exit(1)
+    failures = 0
+    for fn in (test_ddp_two_processes, test_ddp_early_stop_is_synchronised):
+        try:
+            fn()
+            print(f"PASS  {fn.__name__}")
+        except AssertionError as exc:
+            failures += 1
+            print(f"FAIL  {fn.__name__}: {exc}")
+    print(f"\n{failures} failure(s)")
+    sys.exit(1 if failures else 0)

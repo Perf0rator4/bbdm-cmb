@@ -120,7 +120,8 @@ bbdm-cmb/
 │
 ├── bbdm/
 │   ├── config.py                  # paths and hyperparameters
-│   ├── train.py                   # training loop, EMA, deterministic validation
+│   ├── train.py                   # training loop, EMA, deterministic validation, DDP
+│   ├── dist.py                    # torch.distributed helpers (no-ops without torchrun)
 │   ├── sample.py                  # inference and visualisation
 │   ├── evaluate.py                # TF / r_ell / PSNR / SSIM averaged over patches
 │   ├── model/
@@ -128,13 +129,19 @@ bbdm-cmb/
 │   │   └── unet.py                # U-Net backbone (33M parameters)
 │   ├── data/
 │   │   ├── dataset.py             # CMBPatchDataset, tiling, normalisation
-│   │   └── splits.py              # tile-level train/val/test splits
+│   │   └── splits.py              # tile-level splits, split inheritance across frequencies
 │   └── metrics/
 │       └── power_spectrum.py      # RAPSD, Transfer Function, cross-correlation
 │
+├── scripts/
+│   └── train_freq.py              # train + evaluate one frequency pair (90 / 150 / 220 GHz)
+│
 ├── tests/
 │   ├── test_bbdm_math.py          # bridge/sampler/metric math (no data needed)
-│   └── test_dataset.py            # patch filters, normalisation, augmentation
+│   ├── test_dataset.py            # patch filters, normalisation, augmentation
+│   ├── test_phase1.py             # cond channel, upsampling, monitor, checkpoint loading
+│   ├── test_splits_freq.py        # split inheritance and tile-grid checks
+│   └── test_ddp.py                # 2-process DDP on CPU (gloo)
 │
 └── notebooks/
     ├── batching_planck.ipynb      # tiling the full-sky maps
@@ -166,6 +173,45 @@ loading and sanity checks, training (100 epochs, ~32 h on an A40, resumable via
 averaged over 50 patches, and the ETA ablation.
 
 ---
+
+## Training the other frequencies (150 and 220 GHz)
+
+Three channel pairs share one pipeline (`config.FREQ_PAIRS`): Planck 100 -> ACT 90,
+Planck 143 -> ACT 150, Planck 217 -> ACT 220. `scripts/train_freq.py` does what the
+notebook does (split -> normalisation -> datasets -> train -> evaluate best checkpoint
+on val and test) for one pair and writes everything into `--out-dir`
+(`best.pt`, `last.pt`, `splits.json`, `norm.json`, `results.json`, `spectra_*.png`).
+
+```bash
+# one GPU
+CUDA_VISIBLE_DEVICES=0 nohup python scripts/train_freq.py \
+    --freq 150 --data-root /path/to/Diffusion --out-dir runs/f150 > f150.log 2>&1 &
+
+# two GPUs for one frequency (DDP); the global batch is split between the processes
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 scripts/train_freq.py \
+    --freq 150 --data-root /path/to/Diffusion --out-dir runs/f150
+
+# resume an interrupted run: same command plus --resume (same number of processes)
+```
+
+Things worth knowing:
+
+- **Shared split.** Train/val/test of the 150 and 220 GHz runs are inherited from the
+  90 GHz split (`inherit_splits`): a tile that is in the 90 GHz test set is in the test
+  set at every frequency, and the 90 GHz split itself is not changed. Tiles valid only at
+  another frequency are distributed deterministically among themselves. This relies on
+  tiles with the same name lying on the same pixel grid; the script checks the WCS headers
+  and refuses to start otherwise. The split is stored in `splits.json` and reused on resume.
+- **Batch size.** `--global-batch` is the batch across all processes (default
+  `config.BATCH_SIZE`). Keeping it equal to the single-GPU run keeps steps per epoch,
+  `EMA_START` (counted in steps) and the learning rate identical, so runs stay comparable.
+- **Normalisation** (`mu`, `sigma`) is computed per frequency from its own train tiles and
+  stored in `norm.json` and in every checkpoint (`extra`).
+- **Memory.** Every process holds its whole training set in RAM (about 19 GB at 480 px for
+  ~10k pairs); the script prints the estimate. Four processes on one node need four times that.
+- **Reading the bands.** Planck's beam narrows from 100 to 217 GHz, so the multipole where
+  `r_ell` falls moves outwards; `results.json` lists the band edges in ell
+  (`bands_ell`, `planck_beam_ell_1e`).
 
 ## Model
 

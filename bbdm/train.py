@@ -1,14 +1,21 @@
-"""Цикл обучения BBDM с EMA, детерминированной валидацией, резюмом и
-спектральным монитором настоящего сэмплера."""
+"""Цикл обучения BBDM с EMA, детерминированной валидацией, резюмом,
+спектральным монитором настоящего сэмплера и (опционально) DDP на нескольких GPU.
+
+Многопроцессный режим включается сам, если запущено через `torchrun` и
+инициализирован process group (см. `bbdm.dist`); на одном процессе поведение
+не меняется."""
 
 import os
 from copy import deepcopy
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, Subset
+from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
+from bbdm import dist as D
 from bbdm.config import (
     CHECKPOINT_DIR,
     EMA_DECAY,
@@ -59,20 +66,25 @@ class EMA:
 
 
 @torch.no_grad()
-def _validate(bbdm, val_loader, device, spectral_weight, val_seed):
+def _validate(bbdm, val_loader, device, spectral_weight, val_seed, distributed=False):
     """Валидационный лосс с фиксированными t и шумом.
 
     Без фиксации t и eps в q_sample тянутся заново каждую эпоху, и
     val-кривая гуляет на величину, сравнимую с реальным улучшением, --
     тогда и выбор "лучшего" чекпоинта, и ReduceLROnPlateau управляются
     шумом оценки, а не качеством модели.
+
+    distributed=True: каждый ранг считает свой шард val, суммы по рангам
+    сводятся all_reduce, и ВСЕ ранги получают одно и то же число -- иначе
+    ReduceLROnPlateau и выбор best.pt разошлись бы между процессами. В этом
+    режиме лосс усредняется по образцам (в одиночном -- по батчам, как раньше).
     """
     generator = torch.Generator(device=device)
     generator.manual_seed(val_seed)
 
     bbdm.eval()
     total, total_mse, total_spec, n = 0.0, 0.0, 0.0, 0
-    val_bar = tqdm(val_loader, desc="  Val", leave=False)
+    val_bar = tqdm(val_loader, desc="  Val", leave=False, disable=not D.is_main())
     for x0, y in val_bar:
         x0, y = x0.to(device), y.to(device)
         loss, terms = bbdm.loss(
@@ -81,11 +93,18 @@ def _validate(bbdm, val_loader, device, spectral_weight, val_seed):
             generator=generator,
             return_terms=True,
         )
-        total += loss.item()
-        total_mse += terms["mse"].item()
-        total_spec += terms["spec"].item()
-        n += 1
+        w = x0.shape[0] if distributed else 1
+        total += loss.item() * w
+        total_mse += terms["mse"].item() * w
+        total_spec += terms["spec"].item() * w
+        n += w
         val_bar.set_postfix(loss=f"{loss.item():.6f}")
+
+    if distributed:
+        t = torch.tensor([total, total_mse, total_spec, float(n)],
+                         device=device, dtype=torch.float64)
+        D.all_reduce_sum(t)
+        total, total_mse, total_spec, n = (float(v) for v in t)
 
     n = max(n, 1)
     return total / n, total_mse / n, total_spec / n
@@ -155,6 +174,29 @@ def _hparams(bbdm, spectral_weight):
     }
 
 
+class TrainStep(nn.Module):
+    """forward(x0, y) -> (loss, mse, spec). Обёртка под DDP.
+
+    DDP оборачивает ЭТОТ модуль, а не `bbdm.model`: если подменить
+    `bbdm.model` обёрткой, `BBDM.denoise` потеряет атрибут `cond_ch`
+    (`getattr(self.model, "cond_ch", 0)` у DDP вернёт 0), и условие на Planck
+    молча пропало бы; заодно ключи state_dict получили бы префикс `module.`
+    и `load_checkpoint` перестал бы узнавать архитектуру. Так `bbdm.model`
+    остаётся голым UNet-ом, а DDP синхронизирует градиенты всех параметров.
+    """
+
+    def __init__(self, bbdm, spectral_weight):
+        super().__init__()
+        self.bbdm = bbdm
+        self.spectral_weight = spectral_weight
+
+    def forward(self, x0, y):
+        loss, terms = self.bbdm.loss(
+            x0, y, spectral_weight=self.spectral_weight, return_terms=True
+        )
+        return loss, terms["mse"], terms["spec"]
+
+
 def train(
     bbdm,
     train_dataset,
@@ -174,10 +216,15 @@ def train(
     monitor_every=MONITOR_EVERY,
     monitor_n=MONITOR_N,
     monitor_S=MONITOR_S,
+    extra_state=None,
 ):
     """Обучает BBDM и возвращает (bbdm, ema).
 
     Args:
+        batch_size: размер батча НА ОДИН процесс. При `torchrun` с k
+            процессами глобальный батч = k * batch_size; чтобы число шагов
+            на эпоху, `ema_start` (в шагах) и LR совпадали с одиночным
+            прогоном, передавайте global_batch // k.
         spectral_weight: вес L1(log RAPSD) в лоссе. 0 -- чистый MSE.
         resume: продолжить с `last.pt` в checkpoint_dir, если он есть.
         overwrite: разрешить НОВЫЙ прогон в папке, где уже есть best.pt /
@@ -185,9 +232,17 @@ def train(
             прошлого многочасового прогона.
         monitor_dataset: если задан, каждые `monitor_every` эпох на первых
             `monitor_n` его патчах прогоняется настоящий сэмплер
-            (`monitor_S` шагов) и печатаются TF / r_ell / r_in по полосам.
+            (`monitor_S` шагов) и печатаются TF / r_ell / r_in по полосам
+            (только на rank 0).
+        extra_state: словарь, который кладётся в каждый чекпоинт под ключом
+            "extra" (mu, sigma, списки тайлов, частота...). Нормализация и
+            сплит должны жить рядом с весами: иначе их приходится пересчитывать
+            из train-тайлов, и на другой машине они молча разойдутся.
     """
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    main = D.is_main()
+    world = D.world_size()
+    distributed = world > 1
+
     last_path = os.path.join(checkpoint_dir, "last.pt")
     best_path = os.path.join(checkpoint_dir, "best.pt")
 
@@ -199,27 +254,49 @@ def train(
             "перезапишет. Укажите новую checkpoint_dir, resume=True чтобы "
             "продолжить, или overwrite=True, если прошлый прогон не нужен."
         )
+    if main:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+    D.barrier()
 
     loader_kwargs = dict(num_workers=num_workers, pin_memory=(device != "cpu"))
     if num_workers > 0:
         loader_kwargs["persistent_workers"] = True
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        # Хвостовой батч из 1-2 патчей дал бы заметно более шумную оценку
-        # спектрального члена (если он включён) с тем же весом, что и полный.
-        drop_last=True,
-        **loader_kwargs,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        drop_last=False,
-        **loader_kwargs,
-    )
+    if distributed:
+        # Каждый ранг видит свою долю train; set_epoch() ниже перетасовывает
+        # её по-разному каждую эпоху. drop_last: все ранги делают одинаковое
+        # число шагов, иначе collective в backward повиснет.
+        train_sampler = DistributedSampler(
+            train_dataset, num_replicas=world, rank=D.rank(), shuffle=True, drop_last=True
+        )
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, sampler=train_sampler,
+            drop_last=True, **loader_kwargs,
+        )
+        # val шардируется без повторов (в отличие от DistributedSampler,
+        # который добивает хвост дублями и сместил бы среднее).
+        val_loader = DataLoader(
+            Subset(val_dataset, range(D.rank(), len(val_dataset), world)),
+            batch_size=batch_size, shuffle=False, drop_last=False, **loader_kwargs,
+        )
+    else:
+        train_sampler = None
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            # Хвостовой батч из 1-2 патчей дал бы заметно более шумную оценку
+            # спектрального члена (если он включён) с тем же весом, что и полный.
+            drop_last=True,
+            **loader_kwargs,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            drop_last=False,
+            **loader_kwargs,
+        )
 
     bbdm = bbdm.to(device)
     optimizer = torch.optim.Adam(bbdm.parameters(), lr=lr)
@@ -243,21 +320,35 @@ def train(
         start_epoch = ckpt["epoch"] + 1
         best_val_loss = ckpt["best_val_loss"]
         monitor_history = ckpt.get("monitor", [])
-        print(f"Resumed from epoch {start_epoch} (step {global_step})")
+        if main:
+            print(f"Resumed from epoch {start_epoch} (step {global_step})")
 
-    epoch_bar = tqdm(range(start_epoch, n_epochs), desc="Epochs")
+    step_module = TrainStep(bbdm, spectral_weight)
+    if distributed:
+        use_cuda = str(device).startswith("cuda")
+        step_module = DDP(
+            step_module,
+            device_ids=[torch.device(device).index] if use_cuda else None,
+            # m_t / delta_t -- константные буферы, рассылать их каждый шаг незачем.
+            broadcast_buffers=False,
+        )
+        # При создании DDP веса rank 0 рассылаются остальным, так что старт
+        # одинаковый, даже если модели строились с разными сидами.
+
+    epoch_bar = tqdm(range(start_epoch, n_epochs), desc="Epochs", disable=not main)
 
     for epoch in epoch_bar:
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         bbdm.train()
-        train_loss, train_mse, train_spec, n_batches = 0.0, 0.0, 0.0, 0
-        train_bar = tqdm(train_loader, desc="  Train", leave=False)
+        step_module.train()
+        acc = torch.zeros(4, dtype=torch.float64)  # loss, mse, spec, n_batches
+        train_bar = tqdm(train_loader, desc="  Train", leave=False, disable=not main)
 
         for x0, y in train_bar:
             x0, y = x0.to(device, non_blocking=True), y.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            loss, terms = bbdm.loss(
-                x0, y, spectral_weight=spectral_weight, return_terms=True
-            )
+            loss, mse, spec = step_module(x0, y)
             loss.backward()
             nn.utils.clip_grad_norm_(bbdm.parameters(), GRAD_CLIP)
             optimizer.step()
@@ -270,24 +361,25 @@ def train(
             elif global_step > ema_start:
                 ema.update(bbdm.model)
 
-            train_loss += loss.item()
-            train_mse += terms["mse"].item()
-            train_spec += terms["spec"].item()
-            n_batches += 1
+            acc += torch.tensor([loss.item(), mse.item(), spec.item(), 1.0],
+                                dtype=torch.float64)
             global_step += 1
-            train_bar.set_postfix(
-                loss=f"{loss.item():.6f}",
-                mse=f"{terms['mse'].item():.6f}",
-                spec=f"{terms['spec'].item():.4f}",
-            )
+            if main:
+                train_bar.set_postfix(
+                    loss=f"{loss.item():.6f}",
+                    mse=f"{mse.item():.6f}",
+                    spec=f"{spec.item():.4f}",
+                )
 
-        n_batches = max(n_batches, 1)
-        train_loss /= n_batches
-        train_mse /= n_batches
-        train_spec /= n_batches
+        acc = acc.to(device)
+        D.all_reduce_sum(acc)  # no-op на одном процессе
+        n_batches = max(float(acc[3]), 1.0)
+        train_loss = float(acc[0]) / n_batches
+        train_mse = float(acc[1]) / n_batches
+        train_spec = float(acc[2]) / n_batches
 
         val_loss, val_mse, val_spec = _validate(
-            bbdm, val_loader, device, spectral_weight, val_seed
+            bbdm, val_loader, device, spectral_weight, val_seed, distributed=distributed
         )
         scheduler.step(val_loss)
 
@@ -305,37 +397,45 @@ def train(
         if global_step < ema_start:
             ema.copy_from(bbdm.model)
 
-        if monitor_dataset is not None and monitor_every and (epoch + 1) % monitor_every == 0:
+        if main and monitor_dataset is not None and monitor_every and (epoch + 1) % monitor_every == 0:
             monitor_history.append(
                 _run_monitor(bbdm, ema, monitor_dataset, device, monitor_n, monitor_S, epoch)
             )
 
-        state = {
-            "epoch": epoch,
-            "global_step": global_step,
-            "model": bbdm.state_dict(),
-            "ema": ema.shadow.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "val_loss": val_loss,
-            "val_mse": val_mse,
-            "val_spec": val_spec,
-            "train_loss": train_loss,
-            "best_val_loss": min(best_val_loss, val_loss),
-            # Гиперпараметры процесса и архитектуры рядом с весами: иначе при
-            # инференсе легко молча взять другое T/s/eta или другую сеть.
-            "hparams": _hparams(bbdm, spectral_weight),
-            "monitor": monitor_history,
-        }
-        torch.save(state, last_path)
+        if main:
+            state = {
+                "epoch": epoch,
+                "global_step": global_step,
+                "model": bbdm.state_dict(),
+                "ema": ema.shadow.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "val_loss": val_loss,
+                "val_mse": val_mse,
+                "val_spec": val_spec,
+                "train_loss": train_loss,
+                "best_val_loss": min(best_val_loss, val_loss),
+                # Гиперпараметры процесса и архитектуры рядом с весами: иначе при
+                # инференсе легко молча взять другое T/s/eta или другую сеть.
+                "hparams": _hparams(bbdm, spectral_weight),
+                "monitor": monitor_history,
+                "world_size": world,
+                "extra": extra_state or {},
+            }
+            torch.save(state, last_path)
+            if val_loss < best_val_loss:
+                tqdm.write(
+                    f"Epoch {epoch+1} saved best "
+                    f"(val={val_loss:.6f}, mse={val_mse:.6f}, spec={val_spec:.4f})"
+                )
+                torch.save(state, best_path)
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(state, best_path)
-            tqdm.write(
-                f"Epoch {epoch+1} saved best "
-                f"(val={val_loss:.6f}, mse={val_mse:.6f}, spec={val_spec:.4f})"
-            )
+        # val_loss одинаков на всех рангах, так что best_val_loss обновляется
+        # согласованно и без передачи от rank 0.
+        best_val_loss = min(best_val_loss, val_loss)
+        # Остальные ранги не должны убежать вперёд, пока rank 0 считает
+        # монитор и пишет чекпоинт (иначе вечное ожидание в collective).
+        D.barrier()
 
     return bbdm, ema
 

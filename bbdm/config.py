@@ -20,6 +20,32 @@ CHECKPOINT_DIR = ""
 # Папка проекта модели
 PROJECT_DIR = ""
 
+# Пары каналов: частота ACT (ГГц) -> (папка Planck, папка ACT+Planck) внутри
+# DATA_ROOT = <BASE_DIR>/Diffusion (так их создаёт batching_planck.ipynb, ячейка 23).
+# Planck 100/143/217 парится с ACT 90/150/220. Сплит train/val/test у всех
+# частот общий -- он наследуется от FREQ_MASTER (см. bbdm.data.splits).
+FREQ_PAIRS = {
+    90:  ("Planck/f100", "Planck+ACT/f090"),
+    150: ("Planck/f143", "Planck+ACT/f150"),
+    220: ("Planck/f217", "Planck+ACT/f220"),
+}
+FREQ_MASTER = 90   # частота, с которой обучена модель run 5; её сплит не меняется
+
+# Наименьший угол луча Planck (FWHM, arcmin) на каждом канале; нужен только
+# чтобы подписать полосы метрик значениями ell. Значения приблизительные.
+PLANCK_BEAM_FWHM_ARCMIN = {90: 9.66, 150: 7.2, 220: 4.9}
+PIXEL_ARCMIN = 0.5
+
+
+def data_dirs(freq, root):
+    """(папка Planck, папка ACT+Planck) для канала `freq` под корнем `root`."""
+    import os
+
+    if freq not in FREQ_PAIRS:
+        raise ValueError(f"freq must be one of {sorted(FREQ_PAIRS)}, got {freq!r}")
+    p, a = FREQ_PAIRS[freq]
+    return os.path.join(root, p), os.path.join(root, a)
+
 # ---------------------------------------------------------------- данные ---
 
 PATCH_SIZE = 480

@@ -5,8 +5,13 @@ import os
 import random
 
 
-def get_tile_splits(planck_dir, train_ratio=0.8, val_ratio=0.1, seed=42):
-    tiles = sorted(os.listdir(planck_dir))
+def split_tile_names(names, train_ratio=0.8, val_ratio=0.1, seed=42):
+    """Старый сплит по тайлам на СПИСКЕ имён (без файловой системы).
+
+    Тот же алгоритм, что и `get_tile_splits` (сортировка, фильтр *.fits, `random.seed`,
+    `random.shuffle`), поэтому на тех же именах даёт тот же сплит, что и run 5.
+    """
+    tiles = sorted(os.path.basename(t.strip()) for t in names if t.strip())
     tiles = [t for t in tiles if t.endswith(".fits")]
 
     random.seed(seed)
@@ -15,10 +20,14 @@ def get_tile_splits(planck_dir, train_ratio=0.8, val_ratio=0.1, seed=42):
     N = len(tiles)
     n_train = int(N * train_ratio)
     n_val = int(N * val_ratio)
+    return tiles[:n_train], tiles[n_train : n_train + n_val], tiles[n_train + n_val :]
 
-    train_tiles = tiles[:n_train]
-    val_tiles = tiles[n_train : n_train + n_val]
-    test_tiles = tiles[n_train + n_val :]
+
+def get_tile_splits(planck_dir, train_ratio=0.8, val_ratio=0.1, seed=42):
+    train_tiles, val_tiles, test_tiles = split_tile_names(
+        os.listdir(planck_dir), train_ratio, val_ratio, seed
+    )
+    N = len(train_tiles) + len(val_tiles) + len(test_tiles)
 
     print(f"Total tiles: {N}")
     print(f"  Train: {len(train_tiles)} tiles -> {len(train_tiles)*4} patches")

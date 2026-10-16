@@ -28,6 +28,7 @@ from bbdm.data import (  # noqa: E402
     load_patch_splits,
     patch_leakage_report,
     save_patch_splits,
+    split_tile_names,
     tile_patch_positions,
     unique_patch_positions,
 )
@@ -140,6 +141,23 @@ def get_tile_splits_from_names(names, train_ratio=0.8, val_ratio=0.1, seed=42):
         return get_tile_splits(tmp, train_ratio, val_ratio, seed)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_split_tile_names_equals_get_tile_splits_and_check_script_accepts_a_names_file():
+    names = _tile_names()
+    assert split_tile_names(names, seed=7) == get_tile_splits_from_names(names, seed=7)
+    # имена с путями и пустыми строками (вывод `ls`, полные пути) не ломают сплит
+    messy = ["", "/some/dir/" + names[0]] + names[1:] + ["notes.txt", "  "]
+    assert split_tile_names(messy, seed=7) == split_tile_names(names, seed=7)
+
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
+    import check_leakage
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "names.txt")
+        with open(path, "w") as f:
+            f.write("\n".join(names))
+        check_leakage.main(["--names-file", path, "--patch-size", str(P)])
 
 
 # --------------------------------------------------------- сплит по позициям

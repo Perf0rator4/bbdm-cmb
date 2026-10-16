@@ -18,6 +18,7 @@ from bbdm.data.splits import (
     patch_leakage_report,
     save_patch_splits,
     save_splits,
+    split_tile_names,
     tile_patch_positions,
     unique_patch_positions,
 )
@@ -39,6 +40,7 @@ __all__ = [
     "patch_leakage_report",
     "save_patch_splits",
     "save_splits",
+    "split_tile_names",
     "tile_patch_positions",
     "tile_to_patches",
     "unique_patch_positions",

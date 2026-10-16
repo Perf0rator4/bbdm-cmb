@@ -32,7 +32,7 @@ from bbdm.config import (
     SPECTRAL_WEIGHT,
     VAL_SEED,
 )
-from bbdm.evaluate import evaluate_spectra
+from bbdm.evaluate import evaluate_spectra, spread_indices
 from bbdm.model import BBDM, UNet
 
 
@@ -125,7 +125,7 @@ def _run_monitor(bbdm, ema, dataset, device, n_patches, S, epoch):
     res = evaluate_spectra(
         monitor_bbdm, dataset,
         mu=getattr(dataset, "mu", 0.0), sigma=getattr(dataset, "sigma", 1.0),
-        indices=list(range(n)), S=S, device=device,
+        indices=spread_indices(len(dataset), n), S=S, device=device,
         batch_size=min(4, n), seed=0, progress=False, with_psnr=True,
     )
 
@@ -345,11 +345,18 @@ def train(
     step_module = TrainStep(bbdm, spectral_weight)
     if distributed:
         use_cuda = str(device).startswith("cuda")
+        # m_t / delta_t -- константные буферы, рассылать их каждый шаг незачем.
+        # В новых torch `broadcast_buffers` объявлен устаревшим (FutureWarning) в
+        # пользу `forward_sync_buffers`; в старых нового имени нет.
+        import inspect
+
+        buf_kw = ({"forward_sync_buffers": False}
+                  if "forward_sync_buffers" in inspect.signature(DDP.__init__).parameters
+                  else {"broadcast_buffers": False})
         step_module = DDP(
             step_module,
             device_ids=[torch.device(device).index] if use_cuda else None,
-            # m_t / delta_t -- константные буферы, рассылать их каждый шаг незачем.
-            broadcast_buffers=False,
+            **buf_kw,
         )
         # При создании DDP веса rank 0 рассылаются остальным, так что старт
         # одинаковый, даже если модели строились с разными сидами.

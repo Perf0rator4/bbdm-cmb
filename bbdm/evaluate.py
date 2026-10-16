@@ -39,6 +39,19 @@ def _temporary_eta(bbdm, eta):
         bbdm.eta = original
 
 
+def spread_indices(n_total, n):
+    """n индексов, равномерно разбросанных по датасету из n_total элементов.
+
+    Зачем. `range(n)` берёт первые n патчей: это несколько СОСЕДНИХ тайлов
+    (по четыре квадранта одного тайла подряд) из одного куска неба. Решение о
+    стопе и итоговые метрики не должны зависеть от того, какой это кусок.
+    Детерминировано, без повторов; при n >= n_total -- все индексы.
+    """
+    if n >= n_total:
+        return list(range(n_total))
+    return sorted(set(int(round(i)) for i in np.linspace(0, n_total - 1, n)))
+
+
 def _iter_batches(dataset, indices, batch_size):
     for start in range(0, len(indices), batch_size):
         chunk = indices[start : start + batch_size]

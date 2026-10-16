@@ -15,8 +15,15 @@
 
 Скрипт делает то же, что `notebooks/training+inference.ipynb`: сплит ->
 нормализация -> датасеты -> модель -> train -> оценка лучшего чекпоинта на
-val и test. Всё складывается в `--out-dir`: best.pt / last.pt, splits.json,
-norm.json, results.json, spectra_{val,test}.png.
+val и test. Всё складывается в `--out-dir`: best.pt / best_metric.pt / last.pt,
+splits.json, norm.json, leakage.json, results.json, spectra_{val,test}.png.
+
+Сплит по умолчанию -- по ПОЗИЦИЯМ ПАТЧЕЙ в блоках (`--split-mode spatial`), общий
+для всех частот и без утечки: тайлы нарезаны с перекрытием 50%, и один и тот
+же патч лежит в нескольких тайлах, поэтому сплит по тайлам (`--split-mode
+legacy`, так учился run 5) отправляет копии train-патчей в val и test.
+`--global-batch` обязателен: от него зависит число шагов на эпоху и эпоха
+старта EMA, а значит и сопоставимость частот между собой.
 """
 
 import argparse
@@ -40,13 +47,19 @@ from bbdm.data import (
     CMBPatchDataset,
     compare_tile_grids,
     compute_normalization,
+    get_patch_splits,
     get_tile_splits,
     inherit_splits,
+    legacy_leakage_report,
     list_tiles,
+    load_patch_splits,
     load_splits,
+    patch_leakage_report,
+    save_patch_splits,
     save_splits,
 )
 from bbdm.early_stop import EarlyStopper
+from bbdm.evaluate import spread_indices
 from bbdm.model import BBDM, UNet
 
 
@@ -58,20 +71,33 @@ def parse_args(argv=None):
     p.add_argument("--data-root", required=True,
                    help="папка, внутри которой лежат Planck/f1xx и Planck+ACT/f0xx")
     p.add_argument("--out-dir", required=True, help="папка прогона (чекпоинты, результаты)")
-    p.add_argument("--global-batch", type=int, default=cfg.BATCH_SIZE,
-                   help="глобальный батч; на один процесс приходится global/число процессов")
+    p.add_argument("--global-batch", type=int, required=True,
+                   help="глобальный батч (обязателен: от него зависят шаги на эпоху и эпоха "
+                        "старта EMA; для сопоставимости с run 5 -- его батч); на один "
+                        "процесс приходится global/число процессов")
+    p.add_argument("--split-mode", choices=("spatial", "legacy"), default="spatial",
+                   help="spatial: уникальные патчи по пространственным блокам, без утечки; "
+                        "legacy: сплит по тайлам (как у run 5, с утечкой)")
+    p.add_argument("--splits-file", default=None,
+                   help="общий для всех частот сплит по позициям патчей (JSON); создаётся при "
+                        "отсутствии. По умолчанию <data-root>/splits_spatial.json")
+    p.add_argument("--block", type=int, default=2,
+                   help="сторона пространственного блока сплита, в патчах (2 -> 8 градусов)")
     p.add_argument("--epochs", type=int, default=cfg.N_EPOCHS)
     p.add_argument("--lr", type=float, default=cfg.LR)
+    p.add_argument("--ema-start", type=int, default=cfg.EMA_START,
+                   help="шаг, с которого стартует EMA (в ШАГАХ оптимизатора, а не эпохах -- "
+                        "поэтому зависит от батча)")
     p.add_argument("--num-workers", type=int, default=cfg.NUM_WORKERS)
     p.add_argument("--seed", type=int, default=cfg.SEED)
     p.add_argument("--resume", action="store_true")
     p.add_argument("--overwrite", action="store_true",
                    help="разрешить новый прогон поверх существующих best.pt/last.pt")
     p.add_argument("--master-splits", default=None,
-                   help="JSON со сплитом главной частоты (например, сохранённым с run 5); "
+                   help="[legacy] JSON со сплитом главной частоты (например, сохранённым с run 5); "
                         "по умолчанию восстанавливается из папки главной частоты")
     p.add_argument("--no-inherit", action="store_true",
-                   help="не наследовать сплит от главной частоты (только для отладки)")
+                   help="[legacy] не наследовать сплит от главной частоты (только для отладки)")
     p.add_argument("--no-early-stop", action="store_true",
                    help="не останавливать по метрикам (только лимит эпох)")
     p.add_argument("--patience", type=int, default=cfg.EARLY_STOP["patience"],
@@ -111,50 +137,117 @@ def _write_json(path, obj):
         json.dump(obj, f, indent=1)
 
 
-def build_splits(args, planck_dir, act_dir):
-    """Сплит train/val/test для этой частоты; пишется в out-dir/splits.json.
+def _existing_freq_dirs(args):
+    """{freq: (planck_dir, act_dir)} для частот, чьи папки реально есть под data-root."""
+    out = {}
+    for f in sorted(cfg.FREQ_PAIRS):
+        pd, ad = cfg.data_dirs(f, args.data_root)
+        if os.path.isdir(pd) and os.path.isdir(ad):
+            out[f] = (pd, ad)
+    return out
 
-    Считает rank 0, остальные после барьера читают файл -- так у всех
-    процессов гарантированно один и тот же сплит.
+
+def build_splits(args, planck_dir, act_dir):
+    """Сплит этой частоты; пишется в out-dir/splits.json (+ leakage.json).
+
+    spatial -> dict {"train"/"val"/"test": множество позиций патчей}, одинаковый для всех
+    частот. legacy -> (train, val, test) списки имён тайлов, как у run 5.
+    Считает rank 0, остальные после барьера читают файл.
     """
     path = os.path.join(args.out_dir, "splits.json")
-    if D.is_main():
-        if os.path.exists(path):
-            # И при --resume, и при повторном запуске нужен ТОТ ЖЕ сплит, а не
-            # пересчитанный по текущему содержимому папки.
-            print(f"Using existing {path}", flush=True)
+    leak_path = os.path.join(args.out_dir, "leakage.json")
+
+    if D.is_main() and not os.path.exists(path):
+        if args.split_mode == "legacy":
+            splits = _legacy_splits(args, planck_dir, act_dir)
+            save_splits(path, *splits, freq=args.freq, mode="legacy")
+            rep = legacy_leakage_report(*splits, patch_size=args.patch_size)
+            _write_json(leak_path, {"mode": "legacy", **rep})
+            for name in ("val", "test"):
+                r = rep[name]
+                print(f"!! LEGACY SPLIT LEAKS: {r['identical_to_train']}/{r['patch_instances']} "
+                      f"{name} patches are exact copies of train patches "
+                      f"({r['overlapping_train']} overlap train by pixels). "
+                      f"Metrics on them are not out-of-sample.", flush=True)
         else:
-            ratios = dict(train_ratio=cfg.TRAIN_RATIO, val_ratio=cfg.VAL_RATIO,
-                          seed=cfg.SEED)
-            if args.freq == cfg.FREQ_MASTER or args.no_inherit:
-                splits = get_tile_splits(planck_dir, **ratios)
+            splits_file = args.splits_file or os.path.join(args.data_root, "splits_spatial.json")
+            if os.path.exists(splits_file):
+                print(f"Using shared patch splits {splits_file}", flush=True)
+                sp, ps = load_patch_splits(splits_file)
+                if ps != args.patch_size:
+                    raise RuntimeError(f"{splits_file} построен для патчей {ps} px, а --patch-size "
+                                       f"{args.patch_size}")
             else:
-                m_planck, m_act = cfg.data_dirs(cfg.FREQ_MASTER, args.data_root)
-                if args.master_splits:
-                    master = load_splits(args.master_splits)
-                else:
-                    master = get_tile_splits(m_planck, **ratios)
-                # Имена tile_y{y}_x{x} означают одно небо только на общей сетке.
-                bad = compare_tile_grids(m_act, act_dir)
-                if bad:
-                    raise RuntimeError(
-                        f"{len(bad)} одноимённых тайлов ACT {cfg.FREQ_MASTER} и {args.freq} "
-                        f"ГГц лежат на РАЗНЫХ пиксельных сетках (например {bad[:3]}). "
-                        "Наследование сплита по имени здесь неверно -- нужен сплит по "
-                        "координатам тайла (WCS)."
-                    )
-                splits = inherit_splits(master, list_tiles(planck_dir), **ratios)
-            save_splits(path, *splits, freq=args.freq)
+                sp = _make_spatial_splits(args)
+                try:
+                    save_patch_splits(splits_file, sp, patch_size=args.patch_size,
+                                      block=args.block, seed=cfg.SEED)
+                    print(f"Saved shared patch splits to {splits_file}", flush=True)
+                except OSError as e:
+                    print(f"(could not write {splits_file}: {e}; the copy in out-dir is used)",
+                          flush=True)
+            save_patch_splits(path, sp, patch_size=args.patch_size, block=args.block,
+                              seed=cfg.SEED, freq=args.freq, mode="spatial")
+            rep = patch_leakage_report(sp, patch_size=args.patch_size)
+            _write_json(leak_path, {"mode": "spatial", **rep})
+            print(f"Leakage audit: {rep}", flush=True)
+            if any(v["overlapping"] for v in rep.values()):
+                raise RuntimeError(f"patch splits are not leak-free: {rep}")
     D.barrier()
-    return load_splits(path)
+
+    if args.split_mode == "legacy":
+        return load_splits(path)
+    sp, _ = load_patch_splits(path)
+    return {k: set(v) for k, v in sp.items()}
 
 
-def build_norm(args, planck_dir, act_dir, train_tiles):
-    """(mu, sigma) по train-тайлам этой частоты; считает rank 0, остальные читают."""
+def _make_spatial_splits(args):
+    """Общий сплит по позициям: по объединению тайлов всех частот, что есть на диске."""
+    dirs = _existing_freq_dirs(args)
+    if args.freq not in dirs:
+        raise FileNotFoundError(f"нет папок для {args.freq} ГГц под {args.data_root}")
+    # Позиции -- в общей пиксельной сетке; одноимённые тайлы разных частот обязаны её делить.
+    ref_f = sorted(dirs)[0]
+    for f, (pd, ad) in dirs.items():
+        if f == ref_f:
+            continue
+        bad = compare_tile_grids(dirs[ref_f][1], ad)
+        if bad:
+            raise RuntimeError(
+                f"{len(bad)} одноимённых тайлов ACT {ref_f} и {f} ГГц на РАЗНЫХ пиксельных "
+                f"сетках (например {bad[:3]}): общий сплит по позициям неприменим."
+            )
+    tiles = sorted({t for pd, _ in dirs.values() for t in list_tiles(pd)})
+    print(f"Splitting the sky once for frequencies {sorted(dirs)} ({len(tiles)} tiles)", flush=True)
+    return get_patch_splits(tiles, patch_size=args.patch_size, block=args.block,
+                            train_ratio=cfg.TRAIN_RATIO, val_ratio=cfg.VAL_RATIO, seed=cfg.SEED)
+
+
+def _legacy_splits(args, planck_dir, act_dir):
+    ratios = dict(train_ratio=cfg.TRAIN_RATIO, val_ratio=cfg.VAL_RATIO, seed=cfg.SEED)
+    if args.freq == cfg.FREQ_MASTER or args.no_inherit:
+        return get_tile_splits(planck_dir, **ratios)
+    m_planck, m_act = cfg.data_dirs(cfg.FREQ_MASTER, args.data_root)
+    master = load_splits(args.master_splits) if args.master_splits else get_tile_splits(m_planck, **ratios)
+    bad = compare_tile_grids(m_act, act_dir)
+    if bad:
+        raise RuntimeError(
+            f"{len(bad)} одноимённых тайлов ACT {cfg.FREQ_MASTER} и {args.freq} ГГц на РАЗНЫХ "
+            f"пиксельных сетках (например {bad[:3]}); наследование сплита по имени неверно."
+        )
+    return inherit_splits(master, list_tiles(planck_dir), **ratios)
+
+
+def build_norm(args, planck_dir, act_dir, train_tiles, train_positions=None):
+    """(mu, sigma) по train-патчам этой частоты; считает rank 0, остальные читают.
+
+    В spatial-режиме по уникальным позициям (патч из четырёх тайлов -- один раз).
+    """
     path = os.path.join(args.out_dir, "norm.json")
     if D.is_main() and not os.path.exists(path):
         mu, sigma = compute_normalization(planck_dir, act_dir, train_tiles,
-                                          patch_size=args.patch_size)
+                                          patch_size=args.patch_size,
+                                          keep_positions=train_positions)
         _write_json(path, {"mu": mu, "sigma": sigma, "freq": args.freq})
     D.barrier()
     with open(path) as f:
@@ -195,7 +288,8 @@ def evaluate_run(args, bbdm, device, val_ds, test_ds, mu, sigma, extra=None):
 
     for name, ds in (("val", val_ds), ("test", test_ds)):
         n = min(args.eval_patches, len(ds))
-        res = evaluate_spectra(bbdm, ds, mu, sigma, indices=list(range(n)),
+        idx = spread_indices(len(ds), n)
+        res = evaluate_spectra(bbdm, ds, mu, sigma, indices=idx,
                                S=args.eval_S, device=device,
                                batch_size=min(4, max(n, 1)), progress=False)
         print_band_table(res, f"{args.freq} GHz, {name}")
@@ -211,7 +305,7 @@ def evaluate_run(args, bbdm, device, val_ds, test_ds, mu, sigma, extra=None):
             "r_input_bands": res["r_input_bands"],
         }
         if name == "val":
-            m = evaluate_image_metrics(bbdm, ds, mu, sigma, indices=list(range(n)),
+            m = evaluate_image_metrics(bbdm, ds, mu, sigma, indices=idx,
                                        S=args.eval_S, device=device,
                                        batch_size=min(4, max(n, 1)), progress=False)
             results["val"].update({k: m[k] for k in ("psnr_mean", "psnr_std",
@@ -246,13 +340,28 @@ def main(argv=None):
             f"(global {args.global_batch})")
 
         D.barrier()
-        train_tiles, val_tiles, test_tiles = build_splits(args, planck_dir, act_dir)
-        if args.max_tiles:
-            n = args.max_tiles
-            train_tiles, val_tiles, test_tiles = train_tiles[:n], val_tiles[:n], test_tiles[:n]
-        log(f"   tiles: train {len(train_tiles)}, val {len(val_tiles)}, test {len(test_tiles)}")
+        splits = build_splits(args, planck_dir, act_dir)
+        all_tiles = list_tiles(planck_dir)
+        pos = {}
+        if args.split_mode == "legacy":
+            train_tiles, val_tiles, test_tiles = splits
+            if args.max_tiles:
+                n = args.max_tiles
+                train_tiles, val_tiles, test_tiles = train_tiles[:n], val_tiles[:n], test_tiles[:n]
+            tile_lists = {"train": train_tiles, "val": val_tiles, "test": test_tiles}
+            pos = {"train": None, "val": None, "test": None}
+            log(f"   [legacy split] tiles: train {len(train_tiles)}, val {len(val_tiles)}, "
+                f"test {len(test_tiles)}")
+        else:
+            if args.max_tiles:
+                splits = {k: set(sorted(v)[: args.max_tiles * 4]) for k, v in splits.items()}
+            tile_lists = {k: all_tiles for k in ("train", "val", "test")}
+            pos = splits
+            log(f"   [spatial split] patch positions: train {len(splits['train'])}, "
+                f"val {len(splits['val'])}, test {len(splits['test'])} "
+                f"(shared by all frequencies, leak-free; audit in leakage.json)")
 
-        mu, sigma = build_norm(args, planck_dir, act_dir, train_tiles)
+        mu, sigma = build_norm(args, planck_dir, act_dir, tile_lists["train"], pos["train"])
         log(f"   normalization: mu={mu:.4f}, sigma={sigma:.4f}")
 
         common = dict(
@@ -260,12 +369,27 @@ def main(argv=None):
             patch_size=args.patch_size, max_zero_frac=cfg.MAX_ZERO_FRAC,
             max_mask_mismatch_frac=cfg.MAX_MASK_MISMATCH_FRAC,
         )
-        train_ds = CMBPatchDataset(tile_list=train_tiles, augment=True, **common)
-        val_ds = CMBPatchDataset(tile_list=val_tiles, augment=False, **common)
-        test_ds = CMBPatchDataset(tile_list=test_tiles, augment=False, **common)
+        train_ds = CMBPatchDataset(tile_list=tile_lists["train"], augment=True,
+                                   keep_positions=pos["train"], **common)
+        val_ds = CMBPatchDataset(tile_list=tile_lists["val"], augment=False,
+                                 keep_positions=pos["val"], **common)
+        test_ds = CMBPatchDataset(tile_list=tile_lists["test"], augment=False,
+                                  keep_positions=pos["test"], **common)
         gb = len(train_ds.pairs) * 2 * args.patch_size ** 2 * 4 / 1024 ** 3
         log(f"   train patches held in RAM: {len(train_ds.pairs)} pairs ≈ {gb:.1f} GB "
             f"per process ({world} process(es) on this node)")
+
+        steps_per_epoch = len(train_ds) // args.global_batch
+        ema_epoch = args.ema_start / max(steps_per_epoch, 1)
+        log(f"   {len(train_ds)} train samples/epoch (x4 augmentation) / global batch "
+            f"{args.global_batch} = {steps_per_epoch} steps/epoch; EMA starts at step {args.ema_start} "
+            f"-> EMA starts at epoch {ema_epoch:.1f} of {args.epochs}")
+        if ema_epoch >= args.epochs:
+            raise ValueError(f"EMA would never start (epoch {ema_epoch:.1f} >= {args.epochs}); "
+                             "lower --global-batch or pass a smaller --ema-start")
+        if args.global_batch != cfg.BATCH_SIZE:
+            log(f"   note: --global-batch {args.global_batch} differs from config.BATCH_SIZE "
+                f"({cfg.BATCH_SIZE}); keep it equal to the batch of the run you compare with")
 
         unet = UNet(in_ch=cfg.IN_CH, base_ch=args.base_ch, time_dim=args.time_dim,
                     groups=args.groups, cond_ch=1 if cfg.COND_ON_INPUT else 0,
@@ -294,14 +418,16 @@ def main(argv=None):
         train(
             bbdm, train_ds, val_ds,
             n_epochs=args.epochs, batch_size=per_gpu, lr=args.lr,
-            ema_start=cfg.EMA_START, spectral_weight=cfg.SPECTRAL_WEIGHT,
+            ema_start=args.ema_start, spectral_weight=cfg.SPECTRAL_WEIGHT,
             device=device, checkpoint_dir=args.out_dir, num_workers=args.num_workers,
             resume=args.resume, overwrite=args.overwrite,
             monitor_dataset=val_ds, monitor_every=args.monitor_every,
             monitor_n=args.monitor_n, monitor_S=args.monitor_S,
             extra_state={
                 "freq": args.freq, "mu": mu, "sigma": sigma,
-                "splits": {"train": train_tiles, "val": val_tiles, "test": test_tiles},
+                "split_mode": args.split_mode,
+                "split_sizes": {"train": len(train_ds.pairs), "val": len(val_ds.pairs),
+                                "test": len(test_ds.pairs)},
                 "global_batch": args.global_batch,
             },
             early_stop=stopper,

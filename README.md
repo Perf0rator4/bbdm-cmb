@@ -130,12 +130,14 @@ bbdm-cmb/
 │   │   └── unet.py                # U-Net backbone (33M parameters)
 │   ├── data/
 │   │   ├── dataset.py             # CMBPatchDataset, tiling, normalisation
-│   │   └── splits.py              # tile-level splits, split inheritance across frequencies
+│   │   └── splits.py              # patch-position split (leak-free), legacy tile split, leakage audit
 │   └── metrics/
 │       └── power_spectrum.py      # RAPSD, Transfer Function, cross-correlation
 │
 ├── scripts/
-│   └── train_freq.py              # train + evaluate one frequency pair (90 / 150 / 220 GHz)
+│   ├── train_freq.py              # train + evaluate one frequency pair (90 / 150 / 220 GHz)
+│   ├── check_leakage.py           # how many val/test patches of the tile split are copies of train patches
+│   └── eval_clean.py              # evaluate a trained model on unseen vs leaked patches
 │
 ├── tests/
 │   ├── test_bbdm_math.py          # bridge/sampler/metric math (no data needed)
@@ -143,6 +145,7 @@ bbdm-cmb/
 │   ├── test_phase1.py             # cond channel, upsampling, monitor, checkpoint loading
 │   ├── test_splits_freq.py        # split inheritance and tile-grid checks
 │   ├── test_early_stop.py         # early-stopping logic and its place in train()
+│   ├── test_leakage.py            # overlapping tiles, patch-position split, dedup, script end to end
 │   └── test_ddp.py                # 2-process DDP on CPU (gloo)
 │
 └── notebooks/
@@ -185,29 +188,42 @@ on val and test) for one pair and writes everything into `--out-dir`
 (`best.pt`, `last.pt`, `splits.json`, `norm.json`, `results.json`, `spectra_*.png`).
 
 ```bash
-# one GPU
+# one GPU (--global-batch is required: pass the batch of the run you compare with)
 CUDA_VISIBLE_DEVICES=0 nohup python scripts/train_freq.py \
-    --freq 150 --data-root /path/to/Diffusion --out-dir runs/f150 > f150.log 2>&1 &
+    --freq 150 --data-root /path/to/Diffusion --out-dir runs/f150 --global-batch 32 > f150.log 2>&1 &
 
 # two GPUs for one frequency (DDP); the global batch is split between the processes
 CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 scripts/train_freq.py \
-    --freq 150 --data-root /path/to/Diffusion --out-dir runs/f150
+    --freq 150 --data-root /path/to/Diffusion --out-dir runs/f150 --global-batch 32
 
 # resume an interrupted run: same command plus --resume (same number of processes)
 ```
 
 Things worth knowing:
 
-- **Shared split.** Train/val/test of the 150 and 220 GHz runs are inherited from the
-  90 GHz split (`inherit_splits`): a tile that is in the 90 GHz test set is in the test
-  set at every frequency, and the 90 GHz split itself is not changed. Tiles valid only at
-  another frequency are distributed deterministically among themselves. This relies on
-  tiles with the same name lying on the same pixel grid; the script checks the WCS headers
-  and refuses to start otherwise. The split is stored in `splits.json` and reused on resume.
-- **Batch size.** `--global-batch` is the batch across all processes (default
-  `config.BATCH_SIZE`). Keeping it equal to the single-GPU run keeps steps per epoch,
-  `EMA_START` (counted in steps) and the learning rate identical, so runs stay comparable.
-- **Normalisation** (`mu`, `sigma`) is computed per frequency from its own train tiles and
+- **Leak-free split, shared by all frequencies.** Tiles are 960 px cut with stride 480 px and a
+  patch is a 480x480 quadrant of a tile, so the same patch (bit for bit) sits in up to four
+  tiles. A random split *by tiles* (what run 5 was trained with, `--split-mode legacy`) therefore
+  puts copies of train patches into val and test: about 70% of them for a footprint of ~900 tiles
+  (39% to 98% depending on how dense the footprint is; run `scripts/check_leakage.py` on the real
+  tile names to get the exact number). The default `--split-mode spatial` identifies a patch by its
+  absolute position in the ACT pixel grid, splits the unique positions in 2x2-patch blocks, and
+  drops patches that share pixels with a higher-priority split (test > val > train). The split is
+  made once over the union of the tiles of all frequencies and saved to
+  `<data-root>/splits_spatial.json`, so every frequency model is evaluated on the same unseen sky.
+  `leakage.json` in each run directory holds the audit (identical / overlapping pairs, must be 0).
+  This requires tiles with the same name to lie on the same pixel grid; the script checks the WCS
+  headers and refuses to start otherwise.
+- **What this means for run 5.** Its val/test numbers (and the monitor, early stopping and
+  `best.pt` selection that use val) were measured largely on patches the network trained on, so
+  they are not out-of-sample. `scripts/eval_clean.py --ckpt <run 5 best.pt> --data-root ...`
+  evaluates it on the val/test patches that share no pixels with any train patch and, for
+  comparison, on the leaked ones; a lower r_ell on the clean group means part of the signal was
+  memorised.
+- **Batch size.** `--global-batch` is required: it fixes steps per epoch and the epoch at which the
+  EMA starts (`EMA_START` is counted in optimizer steps), so a different batch silently changes the
+  recipe. The script prints both numbers. Keep it equal to the batch of the run you compare with.
+- **Normalisation** (`mu`, `sigma`) is computed per frequency from its own unique train patches and
   stored in `norm.json` and in every checkpoint (`extra`).
 - **Memory.** Every process holds its whole training set in RAM (about 19 GB at 480 px for
   ~10k pairs); the script prints the estimate. Four processes on one node need four times that.
@@ -222,7 +238,10 @@ Training ends when the epoch limit is reached **or** the metrics of the real sam
 `--r-min-delta`, `--tf-max`, `--no-early-stop`). The val loss is not used for this: it is the MSE
 of one diffusion step, and in run 4 it looked fine for 100 epochs while TF at the sampler output
 was 9.5. Every `MONITOR_EVERY` epochs (default 2) the monitor samples 32 validation patches with the
-EMA weights and computes PSNR, TF, r_ell and r_in; the stopper looks at those.
+EMA weights and computes PSNR, TF, r_ell and r_in; the stopper looks at those. The patches are spread
+evenly over the whole validation set (not the first N, which would be a few neighbouring tiles). The monitor
+uses S=50 while the TF thresholds were reasoned from S=200 numbers; compare the last monitor entry with the
+final S=200 evaluation in `results.json` and retune if they differ.
 
 - **Plateau.** A check counts as an improvement if PSNR grew by more than 0.05 dB **or** r_ell grew
   by more than 0.01 in the 0.03-0.10 or 0.10-0.30 band. 8 checks in a row without one -> stop

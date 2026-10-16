@@ -133,3 +133,199 @@ def load_splits(path):
     with open(path) as f:
         d = json.load(f)
     return d["train"], d["val"], d["test"]
+
+
+# =====================================================================
+# Сплит по ПОЗИЦИЯМ ПАТЧЕЙ (без утечки между train / val / test)
+# =====================================================================
+#
+# Почему не по тайлам. Тайлы 960 px нарезаны с шагом 480 px, а патчи -- их
+# квадранты 480x480. Правый нижний квадрант тайла (y, x) -- это ровно левый
+# верхний квадрант тайла (y+480, x+480): одни и те же пиксели карты, бит в бит
+# (различаются лишь границы sigma-clip, которые считаются для каждого тайла
+# отдельно). Случайный сплит по ТАЙЛАМ этого не видит: на геометрии реальной
+# ACT-карты (21 x 89 тайлов) около 70% val/test-патчей оказываются точными
+# копиями какого-то train-патча. Метрики на таких патчах -- не вне выборки, а
+# монитор, ранний останов и best_metric.pt по ним не видят переобучения.
+#
+# Поэтому: (1) патч однозначно определяется абсолютной позицией (py, px) в
+# пиксельной сетке карты; (2) уникальные позиции делятся на блоки по
+# `block` x `block` патчей, и блок целиком уходит в один сплит; (3) патчи,
+# пересекающиеся по пикселям с патчем другого сплита (бывает у выровненных
+# не по 480 px последних строк/столбцов тайлов), отбрасываются из сплита с
+# меньшим приоритетом (test > val > train).
+# Позиции -- в общей сетке ACT, поэтому ОДИН и тот же сплит годится для всех
+# частот (если сетки совпадают; это проверяет `compare_tile_grids`).
+
+import re
+
+_TILE_RE = re.compile(r"tile_y(-?\d+)_x(-?\d+)")
+
+
+def parse_tile_pos(name):
+    """(y, x) из имени `tile_y{y}_x{x}.fits`."""
+    m = _TILE_RE.search(os.path.basename(name))
+    if m is None:
+        raise ValueError(
+            f"{name!r}: имя тайла не вида tile_y{{y}}_x{{x}}.fits -- позицию патча по нему не определить"
+        )
+    return int(m.group(1)), int(m.group(2))
+
+
+def tile_patch_positions(name, patch_size=480):
+    """Абсолютные позиции четырёх патчей тайла в порядке `tile_to_patches` (i*2 + j)."""
+    y, x = parse_tile_pos(name)
+    return [(y + i * patch_size, x + j * patch_size) for i in (0, 1) for j in (0, 1)]
+
+
+def unique_patch_positions(tiles, patch_size=480):
+    """Множество уникальных позиций патчей по списку тайлов."""
+    out = set()
+    for t in tiles:
+        out.update(tile_patch_positions(t, patch_size))
+    return out
+
+
+def _overlap_index(positions, patch_size):
+    """Сетка для быстрого поиска патчей, пересекающихся с данным."""
+    grid = {}
+    for p in positions:
+        grid.setdefault((p[0] // patch_size, p[1] // patch_size), []).append(p)
+    return grid
+
+
+def _overlapping(pos, grid, patch_size):
+    """Позиции из `grid`, пересекающие по пикселям патч `pos` (включая сам `pos`)."""
+    cy, cx = pos[0] // patch_size, pos[1] // patch_size
+    hits = []
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            for q in grid.get((cy + dy, cx + dx), ()):
+                if abs(q[0] - pos[0]) < patch_size and abs(q[1] - pos[1]) < patch_size:
+                    hits.append(q)
+    return hits
+
+
+def get_patch_splits(tiles, patch_size=480, block=2, train_ratio=0.8, val_ratio=0.1, seed=42):
+    """Сплит уникальных патчей по пространственным блокам без утечки.
+
+    Args:
+        tiles: имена тайлов (можно объединение по всем частотам -- тогда сплит
+            общий для всех моделей).
+        block: сторона блока в патчах (2 -> 960 px = 8 градусов). Блок целиком
+            попадает в один сплит, так что соседи по небу не разнесены между
+            train и test внутри блока.
+
+    Returns:
+        dict {"train": [(py, px), ...], "val": [...], "test": [...]}, позиции
+        отсортированы. Гарантия: ни одна пара патчей из разных сплитов не имеет
+        общих пикселей (см. `patch_leakage_report`).
+    """
+    positions = sorted(unique_patch_positions(tiles, patch_size))
+    blocks = {}
+    for p in positions:
+        blocks.setdefault((p[0] // (block * patch_size), p[1] // (block * patch_size)), []).append(p)
+
+    keys = sorted(blocks)
+    random.Random(seed).shuffle(keys)
+
+    n = len(positions)
+    n_test = int(round(n * (1.0 - train_ratio - val_ratio)))
+    n_val = int(round(n * val_ratio))
+
+    out = {"test": [], "val": [], "train": []}
+    for k in keys:
+        if len(out["test"]) < n_test:
+            out["test"].extend(blocks[k])
+        elif len(out["val"]) < n_val:
+            out["val"].extend(blocks[k])
+        else:
+            out["train"].extend(blocks[k])
+
+    # Пересечения между сплитами: у выровненных не по patch_size рядов тайлов
+    # патчи могут перекрываться частично. Приоритет test > val > train.
+    n_dropped = 0
+    for low, high in (("train", "test"), ("train", "val"), ("val", "test")):
+        grid = _overlap_index(out[high], patch_size)
+        keep = []
+        for p in out[low]:
+            if _overlapping(p, grid, patch_size):
+                n_dropped += 1
+            else:
+                keep.append(p)
+        out[low] = keep
+
+    out = {k: sorted(v) for k, v in out.items()}
+    print(
+        f"Patch splits: {n} unique patch positions from {len(tiles)} tiles "
+        f"({4 * len(tiles)} patch instances), block {block}x{block} patches -> "
+        f"train {len(out['train'])}, val {len(out['val'])}, test {len(out['test'])} "
+        f"({n_dropped} dropped for overlapping a higher-priority split)"
+    )
+    return out
+
+
+def patch_leakage_report(splits, patch_size=480):
+    """Аудит: сколько патчей одного сплита совпадают или пересекаются с патчами другого.
+
+    Args:
+        splits: dict {"train": positions, "val": ..., "test": ...}.
+
+    Returns:
+        dict пар -> {"identical": точные копии, "overlapping": пересекающиеся по
+        пикселям (включая копии)}. У корректного сплита всё равно нулю.
+    """
+    rep = {}
+    for a, b in (("val", "train"), ("test", "train"), ("test", "val")):
+        grid = _overlap_index(splits[b], patch_size)
+        bset = set(splits[b])
+        identical = sum(p in bset for p in splits[a])
+        overlapping = sum(bool(_overlapping(p, grid, patch_size)) for p in splits[a])
+        rep[f"{a}->{b}"] = {"n": len(splits[a]), "identical": identical, "overlapping": overlapping}
+    return rep
+
+
+def legacy_leakage_report(train_tiles, val_tiles, test_tiles, patch_size=480):
+    """То же для СТАРОГО сплита по тайлам (`get_tile_splits`): утечка run 5.
+
+    Считает только по именам файлов, данные читать не нужно.
+    """
+    tr = unique_patch_positions(train_tiles, patch_size)
+    rep = {"unique_train_patches": len(tr), "train_patch_instances": 4 * len(train_tiles)}
+    grid = _overlap_index(tr, patch_size)
+    for name, tiles in (("val", val_tiles), ("test", test_tiles)):
+        q = [p for t in tiles for p in tile_patch_positions(t, patch_size)]
+        rep[name] = {
+            "patch_instances": len(q),
+            "identical_to_train": sum(p in tr for p in q),
+            "overlapping_train": sum(bool(_overlapping(p, grid, patch_size)) for p in q),
+        }
+    return rep
+
+
+def clean_eval_positions(train_tiles, eval_tiles, patch_size=480):
+    """Разбивает патчи `eval_tiles` на невиденные и утёкшие относительно train.
+
+    Returns:
+        (clean, leaked): множества позиций; `clean` не пересекается по пикселям
+        НИ с одним train-патчем -- на них метрики честные.
+    """
+    train_grid = _overlap_index(unique_patch_positions(train_tiles, patch_size), patch_size)
+    clean, leaked = set(), set()
+    for p in unique_patch_positions(eval_tiles, patch_size):
+        (leaked if _overlapping(p, train_grid, patch_size) else clean).add(p)
+    return clean, leaked
+
+
+def save_patch_splits(path, splits, patch_size=480, **meta):
+    with open(path, "w") as f:
+        json.dump({"kind": "patch_positions", "patch_size": patch_size, **meta,
+                   **{k: [list(p) for p in v] for k, v in splits.items()}}, f)
+
+
+def load_patch_splits(path):
+    with open(path) as f:
+        d = json.load(f)
+    if d.get("kind") != "patch_positions":
+        raise ValueError(f"{path}: это не сплит по позициям патчей (kind={d.get('kind')!r})")
+    return {k: [tuple(p) for p in d[k]] for k in ("train", "val", "test")}, d["patch_size"]

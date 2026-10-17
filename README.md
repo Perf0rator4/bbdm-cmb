@@ -204,9 +204,8 @@ Things worth knowing:
 - **Leak-free split, shared by all frequencies.** Tiles are 960 px cut with stride 480 px and a
   patch is a 480x480 quadrant of a tile, so the same patch (bit for bit) sits in up to four
   tiles. A random split *by tiles* (what run 5 was trained with, `--split-mode legacy`) therefore
-  puts copies of train patches into val and test: about 70% of them for a footprint of ~900 tiles
-  (39% to 98% depending on how dense the footprint is; run `scripts/check_leakage.py` on the real
-  tile names to get the exact number). The default `--split-mode spatial` identifies a patch by its
+  puts copies of train patches into val and test: 97% of them on the real data (882 tiles: 1050 unique train
+  patches stored 2.69x; measured with `scripts/check_leakage.py`). The default `--split-mode spatial` identifies a patch by its
   absolute position in the ACT pixel grid, splits the unique positions in 2x2-patch blocks, and
   drops patches that share pixels with a higher-priority split (test > val > train). The split is
   made once over the union of the tiles of all frequencies and saved to

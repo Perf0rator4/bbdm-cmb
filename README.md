@@ -105,9 +105,14 @@ and ACT valid masks disagree on more than `MAX_MASK_MISMATCH_FRAC` of pixels —
 the two instruments have different footprints, and a patch valid in only one of
 them teaches the network to reconstruct a mask edge instead of sky.
 
-Splits are made at the **tile** level before patching: the four patches of a
-tile are adjacent on the sky, so a patch-level split would leak nearly identical
-sky between train and test.
+**Test set = the ACT Deep56 field.** Tiles overlap by 50% (960 px, stride 480), so the
+same patch sits in up to four tiles and no split *by tiles* is leak-free. The default split
+(`--split-mode region`) holds out one contiguous field of sky instead: every patch lying
+entirely inside D56 (352° < RA < 40.6°, −8.8° < Dec < 5.2°, 680 deg²) is test, patches
+crossing its border are dropped, val is a set of 8°×8° blocks elsewhere, and the rest of
+the sky is train. Train is read as **random 480-px crops at arbitrary offsets** inside the
+tiles (never touching D56 or a val patch) instead of the ~1600 fixed tile quadrants.
+Details in "Training the frequencies" below.
 
 ---
 
@@ -130,6 +135,7 @@ bbdm-cmb/
 │   │   └── unet.py                # U-Net backbone (33M parameters)
 │   ├── data/
 │   │   ├── dataset.py             # CMBPatchDataset, tiling, normalisation
+│   │   ├── region.py              # D56 test field: RA/Dec -> map pixels, region split, random train crops
 │   │   └── splits.py              # patch-position split (leak-free), legacy tile split, leakage audit
 │   └── metrics/
 │       └── power_spectrum.py      # RAPSD, Transfer Function, cross-correlation
@@ -146,6 +152,7 @@ bbdm-cmb/
 │   ├── test_splits_freq.py        # split inheritance and tile-grid checks
 │   ├── test_early_stop.py         # early-stopping logic and its place in train()
 │   ├── test_leakage.py            # overlapping tiles, patch-position split, dedup, script end to end
+│   ├── test_region.py             # D56 pixel box, region split, random crops, script end to end
 │   └── test_ddp.py                # 2-process DDP on CPU (gloo)
 │
 └── notebooks/
@@ -179,7 +186,7 @@ averaged over 50 patches, and the ETA ablation.
 
 ---
 
-## Training the other frequencies (150 and 220 GHz)
+## Training the frequencies (90, 150 and 220 GHz)
 
 Three channel pairs share one pipeline (`config.FREQ_PAIRS`): Planck 100 -> ACT 90,
 Planck 143 -> ACT 150, Planck 217 -> ACT 220. `scripts/train_freq.py` does what the
@@ -188,24 +195,52 @@ on val and test) for one pair and writes everything into `--out-dir`
 (`best.pt`, `last.pt`, `splits.json`, `norm.json`, `results.json`, `spectra_*.png`).
 
 ```bash
-# one GPU (--global-batch is required: pass the batch of the run you compare with)
-CUDA_VISIBLE_DEVICES=0 nohup python scripts/train_freq.py \
-    --freq 150 --data-root /path/to/Diffusion --out-dir runs/f150 --global-batch 32 > f150.log 2>&1 &
+# the three frequencies in parallel, one GPU each (D56 test field, random train crops)
+DATA=/path/to/Diffusion      # the folder that contains Planck/ and Planck+ACT/
+mkdir -p runs logs
+CUDA_VISIBLE_DEVICES=0 nohup python scripts/train_freq.py --freq 90  --data-root $DATA \
+    --out-dir runs/d56_f90  --global-batch 4 --num-workers 4 > logs/d56_f90.log  2>&1 &
+CUDA_VISIBLE_DEVICES=1 nohup python scripts/train_freq.py --freq 150 --data-root $DATA \
+    --out-dir runs/d56_f150 --global-batch 4 --num-workers 4 > logs/d56_f150.log 2>&1 &
+CUDA_VISIBLE_DEVICES=2 nohup python scripts/train_freq.py --freq 220 --data-root $DATA \
+    --out-dir runs/d56_f220 --global-batch 4 --num-workers 4 > logs/d56_f220.log 2>&1 &
 
 # two GPUs for one frequency (DDP); the global batch is split between the processes
 CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 scripts/train_freq.py \
-    --freq 150 --data-root /path/to/Diffusion --out-dir runs/f150 --global-batch 32
+    --freq 150 --data-root $DATA --out-dir runs/d56_f150 --global-batch 4
 
 # resume an interrupted run: same command plus --resume (same number of processes)
 ```
 
 Things worth knowing:
 
-- **Leak-free split, shared by all frequencies.** Tiles are 960 px cut with stride 480 px and a
+- **The D56 split (`--split-mode region`, default).** The tiles were cut by
+  `batching_planck.ipynb` from the full ACT DR6 / Planck CAR maps (shape 10320 x 43200,
+  0.5'/px), and `tile_y{y}_x{x}` is the tile's pixel offset in that grid, so a field on the sky
+  is a pixel rectangle: `x = 21600 - 120*RA` (RA in [-180, 180)), `y = 7560 + 120*Dec`.
+  D56 (`config.TEST_REGIONS`) becomes y 6504-8185, x 16728-22561; on the real tile list that is
+  36 test patches (3 rows x 12), 33 patches on its border are dropped. Before splitting, the
+  script checks these formulas against the WCS stored in the tile headers and refuses to start if
+  they disagree by more than 2 px. Val is ~10% of the remaining patch positions in 2x2-patch
+  blocks (it drives the monitor and early stopping; the test field is never looked at during
+  training). The split is made once over the union of all frequencies and saved to
+  `<data-root>/splits_region_D56.json`; `leakage.json` in every run holds the audit (patch
+  positions and 20k sampled train crops vs val/test, all must be 0). Other fields:
+  `--test-region ra_min,ra_max,dec_min,dec_max`; a guard band: `--guard-px`.
+- **Random train crops.** `RandomCropDataset` draws a tile uniformly and an offset uniformly in
+  [0, 480]^2, rejects windows touching D56 or a val patch and windows that fail the zero-fraction
+  / mask-mismatch filters, then applies a random flip / 180° rotation. An epoch is
+  `--crops-per-epoch` crops (default `CROPS_PER_POSITION`=4 x the number of train positions, the
+  same count the x4 augmentation of fixed quadrants gave). Crops are read straight from the FITS
+  files (only the needed rows), so nothing is held in RAM and the OS page cache is shared between
+  runs. `--no-crops` trains on the fixed quadrants instead (ablation). D56 is one of ACT's deep
+  fields (lower noise than the average sky), which is worth remembering when comparing test and
+  val numbers.
+- **The older leak-free split (`--split-mode spatial`).** Tiles are 960 px cut with stride 480 px and a
   patch is a 480x480 quadrant of a tile, so the same patch (bit for bit) sits in up to four
   tiles. A random split *by tiles* (what run 5 was trained with, `--split-mode legacy`) therefore
   puts copies of train patches into val and test: 97% of them on the real data (882 tiles: 1050 unique train
-  patches stored 2.69x; measured with `scripts/check_leakage.py`). The default `--split-mode spatial` identifies a patch by its
+  patches stored 2.69x; measured with `scripts/check_leakage.py`). `--split-mode spatial` identifies a patch by its
   absolute position in the ACT pixel grid, splits the unique positions in 2x2-patch blocks, and
   drops patches that share pixels with a higher-priority split (test > val > train). The split is
   made once over the union of the tiles of all frequencies and saved to
@@ -224,8 +259,9 @@ Things worth knowing:
   recipe. The script prints both numbers. Keep it equal to the batch of the run you compare with.
 - **Normalisation** (`mu`, `sigma`) is computed per frequency from its own unique train patches and
   stored in `norm.json` and in every checkpoint (`extra`).
-- **Memory.** Every process holds its whole training set in RAM (about 19 GB at 480 px for
-  ~10k pairs); the script prints the estimate. Four processes on one node need four times that.
+- **Memory.** With random crops (default) train is read from disk; val and test (~200 patches)
+  are held in RAM. With `--no-crops` / `spatial` / `legacy` every process holds its training set
+  in RAM; the script prints the estimate.
 - **Reading the bands.** Planck's beam narrows from 100 to 217 GHz, so the multipole where
   `r_ell` falls moves outwards; `results.json` lists the band edges in ell
   (`bands_ell`, `planck_beam_ell_1e`).

@@ -344,7 +344,8 @@ def test_train_script_runs_with_spatial_split_for_two_frequencies():
         common = ["--data-root", root, "--patch-size", str(P), "--base-ch", "8", "--time-dim", "64",
                   "--groups", "4", "--epochs", "2", "--global-batch", "4", "--num-workers", "0",
                   "--eval-patches", "3", "--eval-S", "3", "--monitor-n", "3", "--monitor-S", "3",
-                  "--monitor-every", "1", "--block", "1", "--ema-start", "20"]
+                  "--monitor-every", "1", "--block", "1", "--ema-start", "20",
+                  "--split-mode", "spatial"]
         train_freq.main(["--freq", "90", "--out-dir", os.path.join(out, "f90")] + common)
         train_freq.main(["--freq", "150", "--out-dir", os.path.join(out, "f150")] + common)
 

@@ -117,12 +117,25 @@ def compute_normalization(
 
 # Патч и цель обязаны получать ОДНО И ТО ЖЕ преобразование, иначе
 # геометрическая связь между входом и целью разрушается.
-AUGMENTATIONS = [
-    lambda x: x,
-    lambda x: np.fliplr(x).copy(),
-    lambda x: np.flipud(x).copy(),
-    lambda x: np.rot90(x, 2).copy(),
-]
+# Функции модуля, а не лямбды: датасет должен пиклиться для воркеров DataLoader
+# при старте через spawn/forkserver (macOS, Python 3.14+).
+def _identity(x):
+    return x
+
+
+def _fliplr(x):
+    return np.fliplr(x).copy()
+
+
+def _flipud(x):
+    return np.flipud(x).copy()
+
+
+def _rot180(x):
+    return np.rot90(x, 2).copy()
+
+
+AUGMENTATIONS = [_identity, _fliplr, _flipud, _rot180]
 
 
 class CMBPatchDataset(Dataset):

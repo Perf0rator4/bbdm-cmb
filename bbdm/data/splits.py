@@ -327,9 +327,13 @@ def clean_eval_positions(train_tiles, eval_tiles, patch_size=480):
 
 
 def save_patch_splits(path, splits, patch_size=480, **meta):
-    with open(path, "w") as f:
+    # Атомарно (временный файл + rename): три частоты могут стартовать одновременно и
+    # читать общий файл сплита, пока его пишет первая.
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "w") as f:
         json.dump({"kind": "patch_positions", "patch_size": patch_size, **meta,
-                   **{k: [list(p) for p in v] for k, v in splits.items()}}, f)
+                   **{k: [list(p) for p in sorted(v)] for k, v in splits.items()}}, f)
+    os.replace(tmp, path)
 
 
 def load_patch_splits(path):

@@ -4,6 +4,16 @@ from bbdm.data.dataset import (
     load_tile,
     tile_to_patches,
 )
+from bbdm.data.region import (
+    ACT_CAR,
+    RandomCropDataset,
+    check_tile_wcs,
+    crop_audit,
+    forbidden_rects,
+    radec_to_pixel,
+    region_box_px,
+    region_splits,
+)
 from bbdm.data.splits import (
     clean_eval_positions,
     compare_tile_grids,
@@ -24,7 +34,15 @@ from bbdm.data.splits import (
 )
 
 __all__ = [
+    "ACT_CAR",
     "CMBPatchDataset",
+    "RandomCropDataset",
+    "check_tile_wcs",
+    "crop_audit",
+    "forbidden_rects",
+    "radec_to_pixel",
+    "region_box_px",
+    "region_splits",
     "clean_eval_positions",
     "compare_tile_grids",
     "compute_normalization",

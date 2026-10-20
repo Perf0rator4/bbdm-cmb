@@ -53,6 +53,20 @@ TRAIN_RATIO = 0.8
 VAL_RATIO = 0.1
 SEED = 42
 
+# Тестовые поля (RA_min, RA_max, Dec_min, Dec_max), градусы. D56 (ACTPol Deep56):
+# 680 кв. град., Dec -8.8..+5.2, 352 < RA < 40.6 -- описание каталога точечных
+# источников ACTPol D56 на LAMBDA (Gralla+2020); в Aiola+2020 (DR4, рис. 1, 6, 7)
+# это то же поле, но числами границы там не даны. Сплит по области:
+# bbdm/data/region.py, scripts/train_freq.py --split-mode region.
+TEST_REGIONS = {
+    "D56": (352.0, 40.6, -8.8, 5.2),
+}
+TEST_REGION = "D56"
+
+# Train-кропов на эпоху = CROPS_PER_POSITION * число train-позиций (квадрантов вне
+# поля и val). 4 -- столько же сэмплов, сколько давала x4-аугментация квадрантов.
+CROPS_PER_POSITION = 4
+
 # Максимальная доля нулевых (замаскированных) пикселей в патче.
 MAX_ZERO_FRAC = 0.2
 

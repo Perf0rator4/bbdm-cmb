@@ -14,3 +14,8 @@ venv/
 
 # local agent context, not part of the project
 CLAUDE.md
+
+# trained runs (from Drive) and generated test sets
+runs/
+runs.tar.gz
+test_set_*/

@@ -143,7 +143,8 @@ bbdm-cmb/
 ├── scripts/
 │   ├── train_freq.py              # train + evaluate one frequency pair (90 / 150 / 220 GHz)
 │   ├── check_leakage.py           # how many val/test patches of the tile split are copies of train patches
-│   └── eval_clean.py              # evaluate a trained model on unseen vs leaked patches
+│   ├── eval_clean.py              # evaluate a trained model on unseen vs leaked patches
+│   └── make_test_set.py           # FITS test set (Planck / true ACT / BBDM, with WCS) for the detection metric
 │
 ├── tests/
 │   ├── test_bbdm_math.py          # bridge/sampler/metric math (no data needed)
@@ -265,6 +266,25 @@ Things worth knowing:
 - **Reading the bands.** Planck's beam narrows from 100 to 217 GHz, so the multipole where
   `r_ell` falls moves outwards; `results.json` lists the band edges in ell
   (`bands_ell`, `planck_beam_ell_1e`).
+
+### Test set for the detection metric
+
+After the three frequencies are trained, `scripts/make_test_set.py` cuts the same windows out of the
+D56 test field for every frequency and writes Planck input, true ACT and BBDM prediction as FITS files
+with the window's WCS (in uK):
+
+```bash
+python scripts/make_test_set.py --data-root /path/to/Diffusion \
+    --runs runs/d56_f90 runs/d56_f150 runs/d56_f220 --out-dir test_set_d56 --S 200
+```
+
+Windows are 480 px with stride 240 (6 x 23 = 138 on the D56 grid). A window is kept only if it lies in
+a tile present at all frequencies and passes the zero / mask-mismatch filters at all of them, so the
+set is identical across the three models. Windows overlap by 50%: a cluster can appear in up to four
+of them, so deduplicate detections by sky position. `index.csv` marks the 36 non-overlapping ones
+(`independent = 1`) and gives each window's centre RA/Dec. The script refuses runs that were not
+trained with the region split (their train could contain D56). `--n-samples k` writes k BBDM samples
+per window (`_s0` ... `_s{k-1}`), for an ensemble noise map.
 
 ## Early stopping by metrics
 

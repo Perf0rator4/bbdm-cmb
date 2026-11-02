@@ -284,7 +284,9 @@ set is identical across the three models. Windows overlap by 50%: a cluster can 
 of them, so deduplicate detections by sky position. `index.csv` marks the 36 non-overlapping ones
 (`independent = 1`) and gives each window's centre RA/Dec. The script refuses runs that were not
 trained with the region split (their train could contain D56). `--n-samples k` writes k BBDM samples
-per window (`_s0` ... `_s{k-1}`), for an ensemble noise map.
+per window (`_s0` ... `_s{k-1}`), for an ensemble noise map. It refuses an `--out-dir` that already
+holds a set, even a partial one (`f*/`, `index.csv`, `manifest.json`); `--overwrite` deletes those, but
+only after the runs and windows have been checked, right before writing.
 
 ## Early stopping by metrics
 

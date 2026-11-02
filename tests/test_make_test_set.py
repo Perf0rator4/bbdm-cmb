@@ -104,6 +104,60 @@ def test_make_test_set_end_to_end():
         shutil.rmtree(out, ignore_errors=True)
 
 
+def test_rerun_needs_overwrite_and_leaves_no_stale_files():
+    import make_test_set
+
+    root = tempfile.mkdtemp(prefix="testset_data_")
+    out = tempfile.mkdtemp(prefix="testset_out_")
+    try:
+        _write_tiles(root, _sky(7))
+        runs = [os.path.join(out, f"run{f}") for f in FREQS]
+        for r, f in zip(runs, FREQS):
+            _write_run(r, f)
+        dest = os.path.join(out, "set")
+        base = ["--data-root", root, "--runs", *runs, "--out-dir", dest, "--S", "3", "--device", "cpu"]
+        make_test_set.main(base + ["--n-samples", "2"])
+        try:
+            make_test_set.main(base)
+        except FileExistsError:
+            pass
+        else:
+            raise AssertionError("a rerun into a filled out-dir was accepted")
+
+        # упавший запуск: FITS есть, index.csv / manifest.json нет -- тоже отказ
+        for name in ("index.csv", "manifest.json"):
+            os.remove(os.path.join(dest, name))
+        try:
+            make_test_set.main(base)
+        except FileExistsError:
+            pass
+        else:
+            raise AssertionError("a rerun over a crashed run's FITS was accepted")
+
+        # --overwrite с ошибкой в --runs падает до удаления: старые FITS на месте
+        before = sorted(os.listdir(os.path.join(dest, "f90", "pred")))
+        bad = ["--data-root", root, "--runs", os.path.join(out, "nope"), "--out-dir", dest,
+               "--S", "3", "--device", "cpu", "--overwrite"]
+        try:
+            make_test_set.main(bad)
+        except FileNotFoundError:
+            pass
+        else:
+            raise AssertionError("a nonexistent run was accepted")
+        assert sorted(os.listdir(os.path.join(dest, "f90", "pred"))) == before and before
+
+        make_test_set.main(base + ["--overwrite", "--stride", str(P)])   # меньше окон, 1 сэмпл
+        names = sorted(r["name"] for r in csv.DictReader(open(os.path.join(dest, "index.csv"))))
+        assert 0 < len(names) <= len(make_test_set.window_grid(BOX, P, P))
+        for f in FREQS:
+            for sub, suffix in (("true", ""), ("planck", ""), ("pred", "_s0")):
+                files = sorted(os.listdir(os.path.join(dest, f"f{f}", sub)))
+                assert files == sorted(n + suffix + ".fits" for n in names), (f, sub)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def test_runs_without_region_split_are_refused():
     import make_test_set
 
@@ -123,5 +177,6 @@ def test_runs_without_region_split_are_refused():
 
 if __name__ == "__main__":
     test_make_test_set_end_to_end()
+    test_rerun_needs_overwrite_and_leaves_no_stale_files()
     test_runs_without_region_split_are_refused()
     print("ok")

@@ -20,6 +20,7 @@ import csv
 import hashlib
 import json
 import os
+import shutil
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -48,6 +49,8 @@ def parse_args(argv=None):
     p.add_argument("--ckpt", choices=["metric", "best"], default="metric",
                    help="best_metric.pt (если есть) или best.pt")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--overwrite", action="store_true",
+                   help="удалить прошлый набор в out-dir (f*/, index.csv, manifest.json) и записать заново")
     return p.parse_args(argv)
 
 
@@ -145,6 +148,19 @@ def window_header(tile_header, oy, ox, p, y, x):
 
 def main(argv=None):
     args = parse_args(argv)
+    # только то, что пишет этот скрипт (в т.ч. от упавшего запуска): f*/ с planck/true/pred, index.csv, manifest.json
+    old = []
+    if os.path.isdir(args.out_dir):
+        for d in os.listdir(args.out_dir):
+            path = os.path.join(args.out_dir, d)
+            if (d.startswith("f") and all(os.path.isdir(os.path.join(path, s)) for s in ("planck", "true", "pred"))
+                    or d in ("index.csv", "manifest.json")):
+                old.append(path)
+    if old and not args.overwrite:
+        raise FileExistsError(
+            f"В {args.out_dir} уже есть тестовый набор ({', '.join(sorted(map(os.path.basename, old)))}). "
+            "Новый запуск оставит старые FITS рядом с новыми. Укажите новую --out-dir или --overwrite, "
+            "если прошлый не нужен.")
     models, (box, p, guard) = load_runs(args.runs, args.ckpt, args.device)
     freqs = sorted(models)
     stride = args.stride or p // 2
@@ -162,6 +178,9 @@ def main(argv=None):
                                  w["oy"], w["ox"], p, w["y"], w["x"])
         w["ra"], w["dec"] = (float(v) for v in WCS(w["hdr"]).wcs_pix2world((p - 1) / 2, (p - 1) / 2, 0))
 
+    # удаляем старый набор только сейчас: прогоны и окна уже проверены, опечатка в аргументах его не сотрёт
+    for path in old:
+        shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)
     os.makedirs(args.out_dir, exist_ok=True)
     for f in freqs:
         bbdm, mu, sigma, ckpt = models[f]

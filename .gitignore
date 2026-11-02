@@ -19,3 +19,4 @@ CLAUDE.md
 runs/
 runs.tar.gz
 test_set_*/
+test_set_*.zip

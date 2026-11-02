@@ -269,6 +269,10 @@ Things worth knowing:
 
 ### Test set for the detection metric
 
+The same steps as a notebook (run where the tiles and `runs/` are; it also checks the mean offset of the
+predictions, plots one window at all frequencies and zips the set for upload):
+`notebooks/make_test_set.ipynb`.
+
 After the three frequencies are trained, `scripts/make_test_set.py` cuts the same windows out of the
 D56 test field for every frequency and writes Planck input, true ACT and BBDM prediction as FITS files
 with the window's WCS (in uK):

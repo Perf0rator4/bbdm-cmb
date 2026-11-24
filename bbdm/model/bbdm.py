@@ -223,14 +223,18 @@ class BBDM(nn.Module):
 
     # ------------------------------------------------------------------ лосс
 
-    def loss(self, x0, y, spectral_weight=None, generator=None, return_terms=False):
-        """MSE по чистому y + спектральный член.
+    def loss(self, x0, y, spectral_weight=None, generator=None, return_terms=False,
+             detection_loss=None, detection_weight=0.0, detection_steps=4):
+        """MSE по чистому y + спектральный член + optional short-chain CFA loss.
 
         Args:
             x0: батч патчей Planck (B, 1, H, W), нормализованных.
             y: батч патчей ACT+Planck (B, 1, H, W), нормализованных.
             spectral_weight: перекрывает self.spectral_weight, если задан.
             generator: генератор для t и шума (воспроизводимая валидация).
+            detection_loss: frozen CFA objective on jointly generated three-channel maps.
+            detection_weight: 0 preserves the original loss and random draws exactly.
+            detection_steps: differentiable reverse steps; never uses ACT as sampler input.
             return_terms: вернуть также словарь со слагаемыми для логов.
         """
         w = self.spectral_weight if spectral_weight is None else float(spectral_weight)
@@ -248,8 +252,19 @@ class BBDM(nn.Module):
             spec = self.spectral_loss(pred, y)
             total = mse + w * spec
 
+        detection = mse.new_zeros(())
+        if detection_weight:
+            if detection_weight < 0 or not math.isfinite(detection_weight) or detection_loss is None:
+                raise ValueError("A nonnegative finite detection weight requires a detection loss")
+            if not isinstance(detection_steps, int) or not 2 <= detection_steps <= self.T:
+                raise ValueError("detection_steps must be between 2 and T")
+            # The detector constrains a generated map, not the posterior-mean denoiser.
+            generated = self.sample_with_grad(x0, S=detection_steps, generator=generator)
+            detection = detection_loss(generated, y, planck=x0)
+            total = total + detection_weight * detection
         if return_terms:
-            return total, {"mse": mse.detach(), "spec": spec.detach()}
+            return total, {"mse": mse.detach(), "spec": spec.detach(),
+                           "detection": detection.detach()}
         return total
 
     # -------------------------------------------------------- обратный процесс
@@ -265,6 +280,10 @@ class BBDM(nn.Module):
             generator: генератор шума (для воспроизводимых сэмплов).
             progress: показывать tqdm-прогрессбар.
         """
+        return self.sample_with_grad(planck, S=S, generator=generator, progress=progress)
+
+    def sample_with_grad(self, planck, S=200, generator=None, progress=False):
+        """Same reverse chain as sample(), with autograd for short-chain training."""
         y_cond = planck  # чистый вход, условие на КАЖДОМ шаге
         if self.eta > 0:
             x_t = planck + math.sqrt(self.eta) * self._randn_like(planck, generator)

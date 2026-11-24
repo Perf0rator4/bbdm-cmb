@@ -8,6 +8,7 @@
 import os
 from copy import deepcopy
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -66,7 +67,8 @@ class EMA:
 
 
 @torch.no_grad()
-def _validate(bbdm, val_loader, device, spectral_weight, val_seed, distributed=False):
+def _validate(bbdm, val_loader, device, spectral_weight, val_seed, distributed=False,
+              detection_kwargs=None):
     """Валидационный лосс с фиксированными t и шумом.
 
     Без фиксации t и eps в q_sample тянутся заново каждую эпоху, и
@@ -83,7 +85,7 @@ def _validate(bbdm, val_loader, device, spectral_weight, val_seed, distributed=F
     generator.manual_seed(val_seed)
 
     bbdm.eval()
-    total, total_mse, total_spec, n = 0.0, 0.0, 0.0, 0
+    total, total_mse, total_spec, total_detection, n = 0.0, 0.0, 0.0, 0.0, 0
     val_bar = tqdm(val_loader, desc="  Val", leave=False, disable=not D.is_main())
     for x0, y in val_bar:
         x0, y = x0.to(device), y.to(device)
@@ -91,26 +93,27 @@ def _validate(bbdm, val_loader, device, spectral_weight, val_seed, distributed=F
             x0, y,
             spectral_weight=spectral_weight,
             generator=generator,
-            return_terms=True,
+            return_terms=True, **(detection_kwargs or {}),
         )
         w = x0.shape[0] if distributed else 1
         total += loss.item() * w
         total_mse += terms["mse"].item() * w
         total_spec += terms["spec"].item() * w
+        total_detection += float(terms.get("detection", 0)) * w
         n += w
         val_bar.set_postfix(loss=f"{loss.item():.6f}")
 
     if distributed:
-        t = torch.tensor([total, total_mse, total_spec, float(n)],
+        t = torch.tensor([total, total_mse, total_spec, total_detection, float(n)],
                          device=device, dtype=torch.float64)
         D.all_reduce_sum(t)
-        total, total_mse, total_spec, n = (float(v) for v in t)
+        total, total_mse, total_spec, total_detection, n = (float(v) for v in t)
 
     n = max(n, 1)
-    return total / n, total_mse / n, total_spec / n
+    return total / n, total_mse / n, total_spec / n, total_detection / n
 
 
-def _run_monitor(bbdm, ema, dataset, device, n_patches, S, epoch):
+def _run_monitor(bbdm, ema, dataset, device, n_patches, S, epoch, detection_loss=None):
     """TF / r_ell / r_in НАСТОЯЩЕГО сэмплера на нескольких val-патчах.
 
     Смысл -- поймать провал, невидимый одношаговому лоссу. В run 4
@@ -122,12 +125,19 @@ def _run_monitor(bbdm, ema, dataset, device, n_patches, S, epoch):
     """
     monitor_bbdm = BBDM(ema.shadow, T=bbdm.T, s=bbdm.s, eta=bbdm.eta).to(device)
     n = min(n_patches, len(dataset))
-    res = evaluate_spectra(
+    channels = getattr(bbdm.model, "in_ch", 1)
+    per_channel = [evaluate_spectra(
         monitor_bbdm, dataset,
         mu=getattr(dataset, "mu", 0.0), sigma=getattr(dataset, "sigma", 1.0),
         indices=spread_indices(len(dataset), n), S=S, device=device,
-        batch_size=min(4, n), seed=0, progress=False, with_psnr=True,
-    )
+        batch_size=min(4, n), seed=0, progress=False, with_psnr=True, channel=channel,
+    ) for channel in range(channels)]
+    res = dict(per_channel[0])
+    if channels > 1:
+        # Stop on excess power in ANY frequency; average information/image scores.
+        for key in ("tf_bands", "r_bands", "r_input_bands", "psnr_mean", "psnr_std"):
+            values = np.asarray([item[key] for item in per_channel])
+            res[key] = (values.max(0) if key == "tf_bands" else values.mean(0)).tolist()
 
     parts = []
     flagged = False
@@ -147,7 +157,7 @@ def _run_monitor(bbdm, ema, dataset, device, n_patches, S, epoch):
                  "как в run 4. Посмотрите до того, как тратить на прогон ещё часы.")
     tqdm.write(line)
 
-    return {
+    entry = {
         "epoch": epoch,
         "S": S,
         "n_patches": n,
@@ -157,7 +167,23 @@ def _run_monitor(bbdm, ema, dataset, device, n_patches, S, epoch):
         "r_input_bands": res["r_input_bands"],
         "psnr": res["psnr_mean"],
         "psnr_std": res["psnr_std"],
+        "per_channel": [{k: item[k] for k in ("tf_bands", "r_bands", "r_input_bands", "psnr_mean")}
+                        for item in per_channel],
     }
+    if detection_loss is not None:
+        total = 0.0
+        indices = spread_indices(len(dataset), n)
+        with torch.no_grad():
+            for start in range(0, n, min(4, n)):
+                pairs = [dataset[i] for i in indices[start:start + min(4, n)]]
+                x0 = torch.stack([pair[0] for pair in pairs]).to(device)
+                y = torch.stack([pair[1] for pair in pairs]).to(device)
+                generator = torch.Generator(device=device).manual_seed(start)
+                generated = monitor_bbdm.sample(x0, S=S, generator=generator)
+                total += float(detection_loss(generated, y, planck=x0)) * len(pairs)
+        entry["detection_heatmap_loss"] = total / n
+        tqdm.write(f"  [monitor] CFA soft heatmap loss (S={S}): {total / n:.6g}")
+    return entry
 
 
 def _hparams(bbdm, spectral_weight):
@@ -178,7 +204,7 @@ def _hparams(bbdm, spectral_weight):
 
 
 class TrainStep(nn.Module):
-    """forward(x0, y) -> (loss, mse, spec). Обёртка под DDP.
+    """forward(x0, y) -> (loss, mse, spec, detection). Обёртка под DDP.
 
     DDP оборачивает ЭТОТ модуль, а не `bbdm.model`: если подменить
     `bbdm.model` обёрткой, `BBDM.denoise` потеряет атрибут `cond_ch`
@@ -188,16 +214,17 @@ class TrainStep(nn.Module):
     остаётся голым UNet-ом, а DDP синхронизирует градиенты всех параметров.
     """
 
-    def __init__(self, bbdm, spectral_weight):
+    def __init__(self, bbdm, spectral_weight, detection_kwargs=None):
         super().__init__()
         self.bbdm = bbdm
         self.spectral_weight = spectral_weight
+        self.detection_kwargs = detection_kwargs or {}
 
     def forward(self, x0, y):
         loss, terms = self.bbdm.loss(
-            x0, y, spectral_weight=self.spectral_weight, return_terms=True
+            x0, y, spectral_weight=self.spectral_weight, return_terms=True, **self.detection_kwargs
         )
-        return loss, terms["mse"], terms["spec"]
+        return loss, terms["mse"], terms["spec"], terms["detection"]
 
 
 def train(
@@ -221,6 +248,9 @@ def train(
     monitor_S=MONITOR_S,
     extra_state=None,
     early_stop=None,
+    detection_loss=None,
+    detection_weight=0.0,
+    detection_steps=4,
 ):
     """Обучает BBDM и возвращает (bbdm, ema).
 
@@ -229,7 +259,10 @@ def train(
             процессами глобальный батч = k * batch_size; чтобы число шагов
             на эпоху, `ema_start` (в шагах) и LR совпадали с одиночным
             прогоном, передавайте global_batch // k.
-        spectral_weight: вес L1(log RAPSD) в лоссе. 0 -- чистый MSE.
+        spectral_weight: вес L1(log RAPSD) в лоссе.
+        detection_loss: frozen CFA objective, kept outside diffusion checkpoints.
+        detection_weight: 0 disables it, positive weight adds the short-chain loss.
+        detection_steps: reverse steps with autograd, default 4.
         resume: продолжить с `last.pt` в checkpoint_dir, если он есть.
         overwrite: разрешить НОВЫЙ прогон в папке, где уже есть best.pt /
             last.pt. По умолчанию запрещено -- это единственная копия
@@ -249,6 +282,18 @@ def train(
             Если `last.pt` уже помечен остановленным, `resume=True` ничего
             не дообучает и сразу возвращает загруженные веса.
     """
+    if not np.isfinite(detection_weight) or detection_weight < 0:
+        raise ValueError("detection_weight must be nonnegative and finite")
+    detection_kwargs, detection_config = {}, None
+    if detection_weight:
+        if detection_loss is None or getattr(bbdm.model, "in_ch", None) != 3:
+            raise ValueError("Detection training requires a CFA loss and three-channel diffusion")
+        if not isinstance(detection_steps, int) or not 2 <= detection_steps <= bbdm.T:
+            raise ValueError("detection_steps must be between 2 and T")
+        detection_loss = detection_loss.to(device).eval()
+        detection_kwargs = dict(detection_loss=detection_loss, detection_weight=detection_weight,
+                                detection_steps=detection_steps)
+        detection_config = dict(**detection_loss.config, weight=detection_weight, steps=detection_steps)
     main = D.is_main()
     world = D.world_size()
     distributed = world > 1
@@ -325,6 +370,8 @@ def train(
 
     if resume and os.path.exists(last_path):
         ckpt = torch.load(last_path, map_location=device, weights_only=False)
+        if ckpt.get("hparams", {}).get("detection") != detection_config:
+            raise ValueError("Resume detection objective/weight/steps/normalization differs from checkpoint")
         bbdm.load_state_dict(ckpt["model"])
         ema.shadow.load_state_dict(ckpt["ema"])
         optimizer.load_state_dict(ckpt["optimizer"])
@@ -342,7 +389,7 @@ def train(
                 print(f"Run already stopped early: {early_stop.stop_reason}")
             return bbdm, ema
 
-    step_module = TrainStep(bbdm, spectral_weight)
+    step_module = TrainStep(bbdm, spectral_weight, detection_kwargs)
     if distributed:
         use_cuda = str(device).startswith("cuda")
         # m_t / delta_t -- константные буферы, рассылать их каждый шаг незачем.
@@ -368,13 +415,13 @@ def train(
             train_sampler.set_epoch(epoch)
         bbdm.train()
         step_module.train()
-        acc = torch.zeros(4, dtype=torch.float64)  # loss, mse, spec, n_batches
+        acc = torch.zeros(5, dtype=torch.float64)  # loss, mse, spec, detection, n_batches
         train_bar = tqdm(train_loader, desc="  Train", leave=False, disable=not main)
 
         for x0, y in train_bar:
             x0, y = x0.to(device, non_blocking=True), y.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            loss, mse, spec = step_module(x0, y)
+            loss, mse, spec, detection = step_module(x0, y)
             loss.backward()
             nn.utils.clip_grad_norm_(bbdm.parameters(), GRAD_CLIP)
             optimizer.step()
@@ -387,7 +434,7 @@ def train(
             elif global_step > ema_start:
                 ema.update(bbdm.model)
 
-            acc += torch.tensor([loss.item(), mse.item(), spec.item(), 1.0],
+            acc += torch.tensor([loss.item(), mse.item(), spec.item(), detection.item(), 1.0],
                                 dtype=torch.float64)
             global_step += 1
             if main:
@@ -395,17 +442,20 @@ def train(
                     loss=f"{loss.item():.6f}",
                     mse=f"{mse.item():.6f}",
                     spec=f"{spec.item():.4f}",
+                    detection=f"{detection.item():.6f}",
                 )
 
         acc = acc.to(device)
         D.all_reduce_sum(acc)  # no-op на одном процессе
-        n_batches = max(float(acc[3]), 1.0)
+        n_batches = max(float(acc[4]), 1.0)
         train_loss = float(acc[0]) / n_batches
         train_mse = float(acc[1]) / n_batches
         train_spec = float(acc[2]) / n_batches
+        train_detection = float(acc[3]) / n_batches
 
-        val_loss, val_mse, val_spec = _validate(
-            bbdm, val_loader, device, spectral_weight, val_seed, distributed=distributed
+        val_loss, val_mse, val_spec, val_detection = _validate(
+            bbdm, val_loader, device, spectral_weight, val_seed, distributed=distributed,
+            detection_kwargs=detection_kwargs
         )
         scheduler.step(val_loss)
 
@@ -414,6 +464,7 @@ def train(
             val=f"{val_loss:.6f}",
             val_mse=f"{val_mse:.6f}",
             val_spec=f"{val_spec:.4f}",
+            val_detection=f"{val_detection:.6f}",
             lr=f"{optimizer.param_groups[0]['lr']:.2e}",
             step=global_step,
         )
@@ -430,7 +481,8 @@ def train(
         )
         stop_now, stop_reason, metric_best = False, None, False
         if main and is_monitor_epoch:
-            entry = _run_monitor(bbdm, ema, monitor_dataset, device, monitor_n, monitor_S, epoch)
+            entry = _run_monitor(bbdm, ema, monitor_dataset, device, monitor_n, monitor_S, epoch,
+                                 detection_loss=detection_loss if detection_weight else None)
             monitor_history.append(entry)
             if early_stop is not None:
                 dec = early_stop.update(entry)
@@ -455,10 +507,14 @@ def train(
                 "val_mse": val_mse,
                 "val_spec": val_spec,
                 "train_loss": train_loss,
+                "train_mse": train_mse,
+                "train_spec": train_spec,
+                "train_detection": train_detection,
+                "val_detection": val_detection,
                 "best_val_loss": min(best_val_loss, val_loss),
                 # Гиперпараметры процесса и архитектуры рядом с весами: иначе при
                 # инференсе легко молча взять другое T/s/eta или другую сеть.
-                "hparams": _hparams(bbdm, spectral_weight),
+                "hparams": {**_hparams(bbdm, spectral_weight), "detection": detection_config},
                 "monitor": monitor_history,
                 "world_size": world,
                 "extra": extra_state or {},

@@ -101,6 +101,7 @@ def evaluate_spectra(
     bands=DEFAULT_BANDS,
     progress=True,
     with_psnr=False,
+    channel=0,
 ):
     """Transfer Function и кросс-корреляция, усреднённые по n_patches патчам.
 
@@ -142,8 +143,12 @@ def evaluate_spectra(
             pred = sample_batch(
                 bbdm, x0, mu, sigma, S=S, device=device, seed=seed + b_i
             )
-            target = y[:, 0].numpy() * sigma + mu
-            source = x0[:, 0].numpy() * sigma + mu
+            channel_mu = np.asarray(mu).reshape(-1)[channel] if np.ndim(mu) else mu
+            channel_sigma = np.asarray(sigma).reshape(-1)[channel] if np.ndim(sigma) else sigma
+            if pred.ndim == 4:
+                pred = pred[:, channel]
+            target = y[:, channel].numpy() * channel_sigma + channel_mu
+            source = x0[:, channel].numpy() * channel_sigma + channel_mu
 
             for k in range(pred.shape[0]):
                 cross_ell, ps_pred, ps_target, freqs = cross_spectrum_terms(

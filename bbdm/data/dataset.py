@@ -124,15 +124,15 @@ def _identity(x):
 
 
 def _fliplr(x):
-    return np.fliplr(x).copy()
+    return np.flip(x, axis=-1).copy()
 
 
 def _flipud(x):
-    return np.flipud(x).copy()
+    return np.flip(x, axis=-2).copy()
 
 
 def _rot180(x):
-    return np.rot90(x, 2).copy()
+    return np.rot90(x, 2, axes=(-2, -1)).copy()
 
 
 AUGMENTATIONS = [_identity, _fliplr, _flipud, _rot180]

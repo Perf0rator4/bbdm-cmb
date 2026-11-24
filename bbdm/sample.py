@@ -11,11 +11,16 @@ import torch
 
 
 def denormalize(patch_norm, mu, sigma):
+    if np.ndim(mu) == 1 or np.ndim(sigma) == 1:
+        if patch_norm.ndim != 4:
+            raise ValueError("Joint inference needs (B, C, H, W); normalization is per channel")
+        mu = np.asarray(mu).reshape(1, -1, 1, 1)
+        sigma = np.asarray(sigma).reshape(1, -1, 1, 1)
     return patch_norm * sigma + mu
 
 
-def _as_batch(x, device):
-    """Приводит (H,W) / (1,H,W) / (B,1,H,W) к тензору (B, 1, H, W) на device."""
+def _as_batch(x, device, channels=1):
+    """Single-channel legacy shapes or joint (C,H,W)/(B,C,H,W) on device."""
     if isinstance(x, torch.Tensor):
         x = x.detach().cpu().numpy()
     x = np.asarray(x, dtype=np.float32)
@@ -23,7 +28,12 @@ def _as_batch(x, device):
     if x.ndim == 2:
         x = x[None, None]
     elif x.ndim == 3:
-        x = x[:, None] if x.shape[0] != 1 else x[None]
+        if channels > 1:
+            if x.shape[0] != channels:
+                raise ValueError("Expected one (C,H,W) joint map or a (B,C,H,W) batch")
+            x = x[None]
+        else:
+            x = x[:, None] if x.shape[0] != 1 else x[None]
     elif x.ndim != 4:
         raise ValueError(f"Expected 2D/3D/4D input, got shape {x.shape}")
 
@@ -44,11 +54,11 @@ def run_inference(
         seed: сид шума обратного процесса (для воспроизводимости).
 
     Returns:
-        Список из n_samples numpy-массивов (H, W) в исходных единицах.
+        Список из n_samples numpy-массивов (H, W), or (C,H,W) for joint models, in uK.
     """
     bbdm = bbdm.to(device).eval()
 
-    planck = _as_batch(x0_norm, device)
+    planck = _as_batch(x0_norm, device, getattr(bbdm.model, "in_ch", 1))
     if planck.shape[0] != 1:
         raise ValueError(
             "run_inference ожидает один патч; для набора патчей используйте "
@@ -66,7 +76,8 @@ def run_inference(
     pred_norm = bbdm.sample(planck, S=S, generator=generator, progress=progress)
     pred_norm = pred_norm.cpu().numpy()
 
-    return [denormalize(pred_norm[i, 0], mu, sigma) for i in range(n_samples)]
+    physical = denormalize(pred_norm, mu, sigma)
+    return [physical[i, 0] if physical.shape[1] == 1 else physical[i] for i in range(n_samples)]
 
 
 @torch.no_grad()
@@ -78,10 +89,10 @@ def sample_batch(bbdm, x0_norm, mu, sigma, S=200, device="cuda", seed=None,
         x0_norm: (B, 1, H, W) или (B, H, W) нормализованных Planck-патчей.
 
     Returns:
-        numpy-массив (B, H, W) в исходных единицах.
+        numpy-массив (B,H,W), or (B,C,H,W) for joint models, in uK.
     """
     bbdm = bbdm.to(device).eval()
-    planck = _as_batch(x0_norm, device)
+    planck = _as_batch(x0_norm, device, getattr(bbdm.model, "in_ch", 1))
 
     generator = None
     if seed is not None:
@@ -89,7 +100,8 @@ def sample_batch(bbdm, x0_norm, mu, sigma, S=200, device="cuda", seed=None,
         generator.manual_seed(seed)
 
     pred_norm = bbdm.sample(planck, S=S, generator=generator, progress=progress)
-    return denormalize(pred_norm[:, 0].cpu().numpy(), mu, sigma)
+    physical = denormalize(pred_norm.cpu().numpy(), mu, sigma)
+    return physical[:, 0] if physical.shape[1] == 1 else physical
 
 
 def visualize_inference(x0_patch, y_patch, pred_patches, shared_scale=True):

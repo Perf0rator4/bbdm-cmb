@@ -303,16 +303,16 @@ class RandomCropDataset(Dataset):
             i, oy, ox = self.sample_window(rng)
             pp, pa = self.read_crop(i, oy, ox)
             valid_p, valid_a = pp != 0, pa != 0
-            if (1.0 - valid_p.mean()) > self.max_zero_frac or (1.0 - valid_a.mean()) > self.max_zero_frac:
+            if np.any((1.0 - valid_p.mean(axis=(-2, -1))) > self.max_zero_frac) or np.any((1.0 - valid_a.mean(axis=(-2, -1))) > self.max_zero_frac):
                 self.n_rejected["zero"] += 1
                 continue
-            if np.logical_xor(valid_p, valid_a).mean() > self.max_mask_mismatch_frac:
+            if np.any(np.logical_xor(valid_p, valid_a).mean(axis=(-2, -1)) > self.max_mask_mismatch_frac):
                 self.n_rejected["mismatch"] += 1
                 continue
             aug = self.augmentations[int(rng.integers(len(self.augmentations)))]
             x0 = torch.from_numpy(self.normalize(aug(pp))).unsqueeze(0).float()
             y = torch.from_numpy(self.normalize(aug(pa))).unsqueeze(0).float()
-            return x0, y
+            return (x0[0], y[0]) if pp.ndim == 3 else (x0, y)
         raise RuntimeError(f"{self.max_tries} кропов подряд не прошли фильтры нулей/масок: "
                            f"{self.n_rejected}")
 

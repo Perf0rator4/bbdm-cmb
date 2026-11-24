@@ -73,10 +73,10 @@ from bbdm.evaluate import spread_indices
 from bbdm.model import BBDM, UNet
 
 
-def parse_args(argv=None):
+def parse_args(argv=None, joint=False):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--freq", type=int, required=True, choices=sorted(cfg.FREQ_PAIRS),
+    p.add_argument("--freq", type=int, required=not joint, default=90 if joint else None, choices=sorted(cfg.FREQ_PAIRS),
                    help="частота ACT, ГГц (Planck-пара берётся из config.FREQ_PAIRS)")
     p.add_argument("--data-root", required=True,
                    help="папка, внутри которой лежат Planck/f1xx и Planck+ACT/f0xx")
@@ -151,6 +151,12 @@ def parse_args(argv=None):
     p.add_argument("--groups", type=int, default=cfg.GROUPS)
     p.add_argument("--max-tiles", type=int, default=0,
                    help="взять только первые N тайлов каждого сплита (отладка)")
+    if joint:
+        p.add_argument("--detector-weights", help="CFA weights; required when detection-weight > 0")
+        p.add_argument("--detection-weight", type=float, required=True,
+                       help="weight of CFA loss; 0 gives the joint pure-MSE control")
+        p.add_argument("--detection-steps", type=int, default=4,
+                       help="reverse-chain steps with autograd for the CFA training loss")
     return p.parse_args(argv)
 
 

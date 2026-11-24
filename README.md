@@ -292,6 +292,90 @@ per window (`_s0` ... `_s{k-1}`), for an ensemble noise map. It refuses an `--ou
 holds a set, even a partial one (`f*/`, `index.csv`, `manifest.json`); `--overwrite` deletes those, but
 only after the runs and windows have been checked, right before writing.
 
+The notebook also runs the CFA detector on ACT, Planck, each BBDM sample and the mean of the
+physical sample maps. Set `N_SAMPLES = 8` for the ensemble check. To evaluate an existing export
+without re-sampling, run its detection section only, or use:
+
+```bash
+python scripts/eval_detection.py --test-set test_set_d56 \
+    --weights cfa-unet_final.pt --freq-order 90 150 220 \
+    --catalog /path/to/clusters.fits
+```
+
+The CFA Python files must be in the repository root; its weights are local (`*.pt` is ignored).
+The supplied detector uses ACT channels in order 90/150/220 GHz and maps in uK. There is no fixed
+angular pixel size: sky coordinates and the matching radius come from each FITS WCS.
+Only `independent = 1` windows are evaluated. The same common ACT/Planck mask is applied to every
+variant; by default, 8 pixels around edges and mask holes are excluded. Inference batches contain
+one image. The default score threshold is 0.1, with a 2.4-arcmin matching tolerance; set
+`--threshold`, `--match-radius-arcmin` and `--edge-margin` on validation, then freeze them for D56.
+The matching tolerance is not the source size; CFA's peak selection still uses a 9x9-pixel window.
+
+`TEST_SET/detection/summary.json` and `per_window.csv` contain one-to-one matches, misses,
+unmatched detections, recall, matched fraction and heatmap MAE relative to ACT. `detections.csv`
+contains pixel coordinates, RA/Dec and scores. Catalogue coordinates default to `RADeg`/`decDeg`
+(degrees); use `--ra-column`/`--dec-column` for other FITS/CSV tables. Without `--catalog`, only
+agreement with CFA detections on ACT is measured, not cluster detection accuracy. An empty
+reference gives null recall; zero detections with a nonempty reference give recall 0. Catalogue
+unmatched objects are not automatically false positives. Planck's 100/143/217-GHz channels differ
+from CFA's ACT training channels, so its baseline includes that domain shift. The three BBDM
+frequency models were trained separately; multi-frequency consistency also needs checking.
+Existing reports are preserved: choose a new `--out-dir` for another evaluation. This is an
+evaluation metric; it does not change diffusion training or add a detector loss.
+
+### Training with the CFA detection loss
+
+`scripts/train_joint.py` trains one three-input/three-output BBDM, in ACT order 90/150/220
+(Planck input 100/143/217). It uses aligned crops, one spatial augmentation for all channels,
+the existing region split, train-only per-channel normalization, EMA and resume.
+The objective is `MSE + detection_weight * CFAHeatmapLoss(sample_short(Planck), ACT)`.
+CFA is frozen, but gradients pass through its Torch preprocessing and soft heatmaps into a
+short reverse chain. This term is not applied to the one-step denoiser prediction. A positive
+weight is an experimental objective, not evidence of improved catalogue recall.
+
+Start with the same joint architecture and `--detection-weight 0` as the MSE control. Then
+run the detection variant in a different output folder, changing only the weight:
+
+```bash
+python scripts/train_joint.py --data-root /path/to/Diffusion \
+    --out-dir runs/joint_cfa --global-batch 1 \
+    --detector-weights /path/to/cfa-unet_final.pt \
+    --detection-weight 0.1 --detection-steps 4
+```
+
+`0.1` is a starting experiment, not a calibrated setting. Select the weight on validation;
+do not tune on D56. Start on the GPU with a two-batch smoke run (add `--epochs 1
+--crops-per-epoch 2 --ema-start 0 --monitor-every 0 --no-early-stop --skip-eval`) in a new
+folder before a full run. Batch 1 limits memory; the differentiable chain is more expensive
+than old single-step training. Full-size joint training refuses a CPU-only runtime. The frozen detector weight file
+is intentionally not in Git; supply it separately. A catalogue is not needed to compute the
+training loss: ACT heatmaps are the reference. Independent recall evaluation still needs one.
+
+Checkpoints log `train_detection`, `val_detection`, train MSE, the detector SHA256, weight,
+short-chain steps and normalization. The normal sampler monitor records per-channel TF/r/PSNR
+and `detection_heatmap_loss` at the monitor's sampling length. Early stopping retains its
+spectral guards and PSNR/r rules; CFA loss is not silently used as catalogue recall or as a new
+stopping rule. Resume (`--resume`) rejects a changed detector objective. `load_checkpoint`
+loads joint checkpoints for inference without needing CFA weights; old checkpoints still load.
+The joint model is a new architecture: existing single-frequency checkpoints are not a resume
+source for it.
+
+Export the trained joint model and run the same independent detection check:
+
+```bash
+python scripts/export_joint.py --run runs/joint_cfa --data-root /path/to/Diffusion \
+    --out-dir test_set_joint_cfa --S 200 --n-samples 8
+python scripts/eval_detection.py --test-set test_set_joint_cfa \
+    --weights /path/to/cfa-unet_final.pt --freq-order 90 150 220 \
+    --catalog /path/to/clusters.fits
+```
+
+The export uses the same common D56 windows, WCS and FITS layout as the earlier three-model
+export. Compare catalogue recall/matched fraction and TF/r against the joint MSE control, the
+old models, ACT and Planck. Changing a detector's soft response can create spurious detections;
+success must be established on held-out objects, not by the training loss alone. An ensemble
+mean is a separate diagnostic from individual stochastic samples.
+
 ## Early stopping by metrics
 
 Training ends when the epoch limit is reached **or** the metrics of the real sampler say stop

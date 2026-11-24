@@ -75,7 +75,7 @@ def _worker(rank, port, tmpdir):
         ds = _PairDataset(8)
         shard = torch.utils.data.Subset(ds, range(rank, len(ds), WORLD))
         loader = torch.utils.data.DataLoader(shard, batch_size=2, shuffle=False)
-        v_dist, _, _ = _validate(_DeterministicLoss(), loader, device, 0.0, 0, distributed=True)
+        v_dist, *_ = _validate(_DeterministicLoss(), loader, device, 0.0, 0, distributed=True)
         # одиночный подсчёт: среднее по всем 8 образцам (батчи равны по размеру)
         v_single = float(sum(((a - b) ** 2).mean() for a, b in
                              (ds[i] for i in range(len(ds)))) / len(ds))
